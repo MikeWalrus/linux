@@ -33,6 +33,7 @@ static inline int __pure __get_cpu_type(const int cpu_type)
 	case CPU_4KC:
 	case CPU_ALCHEMY:
 	case CPU_PR4450:
+	case CPU_PPMIPS:
 #endif
 
 #if defined(CONFIG_SYS_HAS_CPU_MIPS32_R1) || \

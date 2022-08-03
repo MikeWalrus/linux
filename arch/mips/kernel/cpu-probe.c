@@ -1337,7 +1337,12 @@ static inline void cpu_probe_legacy(struct cpuinfo_mips *c, unsigned int cpu)
 			__cpu_name[cpu] = "Loongson 1B";
 			break;
 		}
-
+		break;
+	case PRID_IMP_PPMIPS:
+		decode_configs(c);
+		c->cputype = CPU_PPMIPS;
+		c->options &= ~MIPS_CPU_FPU;
+		__cpu_name[cpu] = "PPMIPS";
 		break;
 	}
 }

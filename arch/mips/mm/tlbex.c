@@ -575,6 +575,7 @@ void build_tlb_write_entry(u32 **p, struct uasm_label **l,
 			uasm_i_nop(p);
 		fallthrough;
 	case CPU_ALCHEMY:
+	case CPU_PPMIPS:
 		tlbw(p);
 		break;
 
