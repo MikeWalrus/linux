@@ -1,0 +1,12 @@
+if MACH_PPMIPS
+
+choice
+    prompt "Machine type"
+    default PPMIPS_NSCSCC
+
+config PPMIPS_NSCSCC
+    bool "PPMIPS SoC for NSCSCC 2022 board"
+
+endchoice
+
+endif

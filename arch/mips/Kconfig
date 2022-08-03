@@ -473,6 +473,19 @@ config MACH_LOONGSON32
 	  the Institute of Computing Technology (ICT), Chinese Academy of
 	  Sciences (CAS).
 
+config MACH_PPMIPS
+	bool "PPMIPS platform"
+	select BOOT_ELF32
+    	select SYS_HAS_EARLY_PRINTK
+    	select SYS_HAS_CPU_MIPS32_R1
+    	select SYS_SUPPORTS_32BIT_KERNEL
+	select SYS_SUPPORTS_LITTLE_ENDIAN
+	select OF_FLATTREE
+	select USE_OF
+	help
+	  This option enables support for PPMIPS/PPMIPS
+
+
 config MACH_LOONGSON2EF
 	bool "Loongson-2E/F family of machines"
 	select SYS_SUPPORTS_ZBOOT
@@ -1017,6 +1030,7 @@ source "arch/mips/cavium-octeon/Kconfig"
 source "arch/mips/loongson2ef/Kconfig"
 source "arch/mips/loongson32/Kconfig"
 source "arch/mips/loongson64/Kconfig"
+source "arch/mips/ppmips/Kconfig"
 
 endmenu
 

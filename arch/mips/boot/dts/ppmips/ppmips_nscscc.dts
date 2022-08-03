@@ -1,0 +1,64 @@
+/dts-v1/;
+
+/ {
+
+    #address-cells= <1>;
+    #size-cells = <1>;
+
+    compatible = "pp,soc_up";
+
+    memory@80000000 {
+        device_type = "memory";
+        reg = <0x0 0x8000000>;
+    };
+
+    cpus {
+
+        #address-cells= <1>;
+        #size-cells = <0>;
+
+        cpu@0 {
+            device_type="cpu";
+            compatible = "mips,4Kc";
+            clock-frequency = <33000000>;
+            reg = <0>;
+          };
+      };
+
+    cpuintc: interrupt-controller {
+        #address-cells = <0>;
+        #interrupt-cells = <1>;
+        interrupt-controller;
+        compatible = "mti,cpu-interrupt-controller";
+     };
+
+    spi_flash@bfe40000 {
+        compatible = "xlnx,xps-spi-2.00.a";
+        reg = <0xbfe40000 0x10000>;
+        interrupt-parent = <&cpuintc>;
+        interrupts = <4>;
+        clock-frequency = <33000000>;
+      };
+
+    ethernet@bff00000 {
+        compatible = "xlnx,axi-ethernetlite-3.0", "xlnx,xps-ethernetlite-1.00.a";
+        local-mac-address = [00 0a 35 00 00 00];
+        reg = <0xbff00000 0x10000>;
+        xlnx,rx-ping-pong = <0x1>;
+        xlnx,tx-ping-pong = <0x1>;
+    } ;
+
+    serial: serial@bfe41000 {
+        compatible = "ns16550a";
+        reg = <0xbfe41000 0x9000>;
+        reg-shift = <2>;
+        interrupt-parent = <&cpuintc>;
+        interrupts = <3>;
+        clock-frequency = <100000000>;
+        current-speed = <230400>;
+    };
+
+    aliases {
+        console = &serial;
+    };
+};

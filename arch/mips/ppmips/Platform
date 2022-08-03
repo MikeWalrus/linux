@@ -1,0 +1,7 @@
+platform-$(CONFIG_MACH_PPMIPS) += ppmips/
+cflags-$(CONFIG_MACH_PPMIPS) += -I$(srctree)/arch/mips/include/asm/mach-ppmips \
+-mno-branch-likely -mno-llsc -mno-mad -mno-imadd -mdivide-breaks
+
+load-$(CONFIG_MACH_PPMIPS)	+= 0xffffffff80010000
+
+
