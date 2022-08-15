@@ -11,7 +11,7 @@
         bootargs = "console=ttyS0,115200n8 earlyprintk=ttyS0,115200n8";
     };
 
-    memory@80000000 {
+    memory@00000000 {
         device_type = "memory";
         reg = <0x0 0x8000000>;
     };
@@ -36,25 +36,25 @@
         compatible = "mti,cpu-interrupt-controller";
      };
 
-    spi_flash@bfe40000 {
+    spi_flash@1fe40000 {
         compatible = "xlnx,xps-spi-2.00.a";
-        reg = <0xbfe40000 0x10000>;
+        reg = <0x1fe40000 0x10000>;
         interrupt-parent = <&cpuintc>;
         interrupts = <4>;
         clock-frequency = <33000000>;
       };
 
-    ethernet@bff00000 {
+    ethernet@1ff00000 {
         compatible = "xlnx,axi-ethernetlite-3.0", "xlnx,xps-ethernetlite-1.00.a";
         local-mac-address = [00 0a 35 00 00 00];
-        reg = <0xbff00000 0x10000>;
+        reg = <0x1ff00000 0x10000>;
         xlnx,rx-ping-pong = <0x1>;
         xlnx,tx-ping-pong = <0x1>;
     } ;
 
-    serial: serial@bfe41000 {
+    serial: serial@1fe41000 {
         compatible = "ns16550a";
-        reg = <0xbfe41000 0x9000>;
+        reg = <0x1fe41000 0x9000>;
         reg-shift = <2>;
         interrupt-parent = <&cpuintc>;
         interrupts = <3>;
