@@ -24,6 +24,7 @@
 			data = /incbin/("boot/dts/ppmips/ppmips_nscscc.dtb");
 			type = "flat_dt";
 			arch = "mips";
+            load = <0x85000000>;
 			compression = "none";
 			hash {
 				algo = "sha1";

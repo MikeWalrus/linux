@@ -11,7 +11,7 @@
         bootargs = "console=ttyS0,115200n8 earlyprintk=ttyS0,115200n8";
     };
 
-    memory@00000000 {
+    memory@0 {
         device_type = "memory";
         reg = <0x0 0x8000000>;
     };
