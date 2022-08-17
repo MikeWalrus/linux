@@ -15,6 +15,6 @@
 
 #define MIPS_CPU_IRQS		(MIPS_CPU_IRQ(7) + 1 - MIPS_CPU_IRQ_BASE)
 
-#define NR_IRQS			(MIPS_CPU_IRQS)
+#define NR_IRQS			256
 
 #endif
