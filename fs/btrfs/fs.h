@@ -422,6 +422,12 @@ struct btrfs_commit_stats {
 	u64 total_commit_dur;
 };
 
+struct thread_pool_sizes {
+	u32 flush_delalloc;
+	u32 delalloc;
+	u32 endio; // end_io*
+};
+
 struct btrfs_fs_info {
 	u8 chunk_tree_uuid[BTRFS_UUID_SIZE];
 	unsigned long flags;
@@ -640,6 +646,7 @@ struct btrfs_fs_info {
 	struct task_struct *transaction_kthread;
 	struct task_struct *cleaner_kthread;
 	u32 thread_pool_size;
+	struct thread_pool_sizes extra_thread_pool_sizes;
 
 	struct kobject *space_info_kobj;
 	struct kobject *qgroups_kobj;

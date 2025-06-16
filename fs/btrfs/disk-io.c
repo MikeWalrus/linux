@@ -1954,6 +1954,7 @@ static void btrfs_init_qgroup(struct btrfs_fs_info *fs_info)
 static int btrfs_init_workqueues(struct btrfs_fs_info *fs_info)
 {
 	u32 max_active = fs_info->thread_pool_size;
+	struct thread_pool_sizes extra_limits = fs_info->extra_thread_pool_sizes;
 	unsigned int flags = WQ_MEM_RECLAIM | WQ_FREEZABLE | WQ_UNBOUND;
 	unsigned int ordered_flags = WQ_MEM_RECLAIM | WQ_FREEZABLE;
 
@@ -1962,11 +1963,11 @@ static int btrfs_init_workqueues(struct btrfs_fs_info *fs_info)
 
 	fs_info->delalloc_workers =
 		btrfs_alloc_workqueue(fs_info, "delalloc",
-				      flags, max_active, 2);
+				      flags, extra_limits.delalloc , 2);
 
 	fs_info->flush_workers =
 		btrfs_alloc_workqueue(fs_info, "flush_delalloc",
-				      flags, max_active, 0);
+				      flags, extra_limits.flush_delalloc, 0);
 
 	fs_info->caching_workers =
 		btrfs_alloc_workqueue(fs_info, "cache", flags, max_active, 0);
@@ -1975,15 +1976,15 @@ static int btrfs_init_workqueues(struct btrfs_fs_info *fs_info)
 		btrfs_alloc_ordered_workqueue(fs_info, "fixup", ordered_flags);
 
 	fs_info->endio_workers =
-		alloc_workqueue("btrfs-endio", flags, max_active);
+		alloc_workqueue("btrfs-endio", flags, extra_limits.endio);
 	fs_info->endio_meta_workers =
-		alloc_workqueue("btrfs-endio-meta", flags, max_active);
+		alloc_workqueue("btrfs-endio-meta", flags, extra_limits.endio);
 	fs_info->rmw_workers = alloc_workqueue("btrfs-rmw", flags, max_active);
 	fs_info->endio_write_workers =
 		btrfs_alloc_workqueue(fs_info, "endio-write", flags,
-				      max_active, 2);
+				      extra_limits.endio, 2);
 	fs_info->compressed_write_workers =
-		alloc_workqueue("btrfs-compressed-write", flags, max_active);
+		alloc_workqueue("btrfs-compressed-write", flags, extra_limits.endio);
 	fs_info->endio_freespace_worker =
 		btrfs_alloc_workqueue(fs_info, "freespace-write", flags,
 				      max_active, 0);
@@ -2853,6 +2854,12 @@ void btrfs_init_fs_info(struct btrfs_fs_info *fs_info)
 
 	fs_info->thread_pool_size = min_t(unsigned long,
 					  num_online_cpus() + 2, 8);
+	fs_info->extra_thread_pool_sizes = (struct thread_pool_sizes){
+		.delalloc = fs_info->thread_pool_size,
+		.flush_delalloc = fs_info->thread_pool_size,
+		.endio = fs_info->thread_pool_size,
+	};
+
 
 	INIT_LIST_HEAD(&fs_info->ordered_roots);
 	spin_lock_init(&fs_info->ordered_root_lock);

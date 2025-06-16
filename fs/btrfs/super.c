@@ -82,6 +82,7 @@ struct btrfs_fs_context {
 	u32 commit_interval;
 	u32 metadata_ratio;
 	u32 thread_pool_size;
+	struct thread_pool_sizes extra_thread_pool_sizes;
 	unsigned long long mount_opt;
 	unsigned long compress_type:4;
 	int compress_level;
@@ -118,6 +119,9 @@ enum {
 	Opt_subvol_empty,
 	Opt_subvolid,
 	Opt_thread_pool,
+	Opt_tp_flush_delalloc,
+	Opt_tp_delalloc,
+	Opt_tp_endio,
 	Opt_treelog,
 	Opt_user_subvol_rm_allowed,
 	Opt_norecovery,
@@ -240,6 +244,9 @@ static const struct fs_parameter_spec btrfs_fs_parameters[] = {
 	fsparam_flag("subvol=", Opt_subvol_empty),
 	fsparam_u64("subvolid", Opt_subvolid),
 	fsparam_u32("thread_pool", Opt_thread_pool),
+	fsparam_u32("tp_delalloc", Opt_tp_delalloc),
+	fsparam_u32("tp_flush_delalloc", Opt_tp_flush_delalloc),
+	fsparam_u32("tp_endio", Opt_tp_endio),
 	fsparam_flag_no("treelog", Opt_treelog),
 	fsparam_flag("user_subvol_rm_allowed", Opt_user_subvol_rm_allowed),
 
@@ -415,6 +422,15 @@ static int btrfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 			return -EINVAL;
 		}
 		ctx->thread_pool_size = result.uint_32;
+		break;
+	case Opt_tp_delalloc:
+		ctx->extra_thread_pool_sizes.delalloc = result.uint_32;
+		break;
+	case Opt_tp_flush_delalloc:
+		ctx->extra_thread_pool_sizes.flush_delalloc = result.uint_32;
+		break;
+	case Opt_tp_endio:
+		ctx->extra_thread_pool_sizes.endio = result.uint_32;
 		break;
 	case Opt_max_inline:
 		ctx->max_inline = memparse(param->string, NULL);
@@ -1062,6 +1078,9 @@ static int btrfs_show_options(struct seq_file *seq, struct dentry *dentry)
 	if (info->thread_pool_size !=  min_t(unsigned long,
 					     num_online_cpus() + 2, 8))
 		seq_printf(seq, ",thread_pool=%u", info->thread_pool_size);
+	seq_printf(seq, ",tp_delalloc=%u", info->extra_thread_pool_sizes.delalloc);
+	seq_printf(seq, ",tp_flush_delalloc=%u", info->extra_thread_pool_sizes.flush_delalloc);
+	seq_printf(seq, ",tp_endio=%u", info->extra_thread_pool_sizes.endio);
 	if (btrfs_test_opt(info, COMPRESS)) {
 		compress_type = btrfs_compress_type2str(info->compress_type);
 		if (btrfs_test_opt(info, FORCE_COMPRESS))
@@ -1393,6 +1412,7 @@ static void btrfs_ctx_to_info(struct btrfs_fs_info *fs_info, struct btrfs_fs_con
 	fs_info->commit_interval = ctx->commit_interval;
 	fs_info->metadata_ratio = ctx->metadata_ratio;
 	fs_info->thread_pool_size = ctx->thread_pool_size;
+	fs_info->extra_thread_pool_sizes = ctx->extra_thread_pool_sizes;
 	fs_info->mount_opt = ctx->mount_opt;
 	fs_info->compress_type = ctx->compress_type;
 	fs_info->compress_level = ctx->compress_level;
@@ -1404,6 +1424,7 @@ static void btrfs_info_to_ctx(struct btrfs_fs_info *fs_info, struct btrfs_fs_con
 	ctx->commit_interval = fs_info->commit_interval;
 	ctx->metadata_ratio = fs_info->metadata_ratio;
 	ctx->thread_pool_size = fs_info->thread_pool_size;
+	ctx->extra_thread_pool_sizes = fs_info->extra_thread_pool_sizes;
 	ctx->mount_opt = fs_info->mount_opt;
 	ctx->compress_type = fs_info->compress_type;
 	ctx->compress_level = fs_info->compress_level;
@@ -2154,6 +2175,11 @@ static int btrfs_init_fs_context(struct fs_context *fc)
 	} else {
 		ctx->thread_pool_size =
 			min_t(unsigned long, num_online_cpus() + 2, 8);
+		ctx->extra_thread_pool_sizes = (struct thread_pool_sizes) {
+			.delalloc = ctx->thread_pool_size,
+			.flush_delalloc = ctx->thread_pool_size,
+			.endio = ctx->thread_pool_size,
+		};
 		ctx->max_inline = BTRFS_DEFAULT_MAX_INLINE;
 		ctx->commit_interval = BTRFS_DEFAULT_COMMIT_INTERVAL;
 	}
