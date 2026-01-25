@@ -80,6 +80,7 @@ Documentation for filesystem implementations.
    configfs
    cramfs
    dax
+   dfs
    debugfs
    dlmfs
    ecryptfs
