@@ -1,0 +1,6 @@
+config DFS_FS
+	bool "Direct File System (DFS) (RAM-only prototype)"
+	depends on MMU
+	help
+	  DFS is a research file system based on the DFS paper. This initial
+	  implementation is RAM-backed and does not provide durability.
