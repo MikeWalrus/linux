@@ -4,14 +4,16 @@
 #include <linux/pagemap.h>
 #include <linux/init.h>
 #include <linux/string.h>
-#include <linux/ramfs.h>
-#include <linux/magic.h>
-#include <linux/slab.h>
+#include <linux/buffer_head.h>
+#include <linux/blkdev.h>
+#include <linux/math64.h>
+#include <linux/statfs.h>
 #include <linux/fs_context.h>
+#include <linux/magic.h>
+#include <linux/ramfs.h>
+#include <linux/slab.h>
 
 #include "internal.h"
-
-#define DFS_MAGIC 0x444653
 
 static const struct super_operations dfs_ops;
 static const struct inode_operations dfs_dir_inode_operations;
@@ -156,19 +158,61 @@ static const struct inode_operations dfs_dir_inode_operations = {
 	.tmpfile	= dfs_tmpfile,
 };
 
+static int dfs_statfs(struct dentry *dentry, struct kstatfs *buf)
+{
+	struct super_block *sb = dentry->d_sb;
+	u64 id = huge_encode_dev(sb->s_dev);
+	u64 blocks = 0;
+
+	if (sb->s_bdev)
+		blocks = div_u64(bdev_nr_bytes(sb->s_bdev), sb->s_blocksize);
+
+	buf->f_type = DFS_SUPER_MAGIC;
+	buf->f_bsize = sb->s_blocksize;
+	buf->f_blocks = blocks;
+	buf->f_bfree = blocks;
+	buf->f_bavail = blocks;
+	buf->f_files = 0;
+	buf->f_ffree = 0;
+	buf->f_fsid = u64_to_fsid(id);
+	buf->f_namelen = NAME_MAX;
+	return 0;
+}
+
 static const struct super_operations dfs_ops = {
-	.statfs		= simple_statfs,
+	.statfs		= dfs_statfs,
 	.drop_inode	= inode_just_drop,
 };
+
+static int dfs_validate_super(struct super_block *sb)
+{
+	struct buffer_head *bh;
+	struct dfs_super_block *disk;
+	int ret = 0;
+
+	bh = sb_bread(sb, 0);
+	if (!bh)
+		return -EIO;
+
+	disk = (struct dfs_super_block *)bh->b_data;
+	if (le32_to_cpu(disk->magic) != DFS_SUPER_MAGIC)
+		ret = -EINVAL;
+
+	brelse(bh);
+	return ret;
+}
 
 static int dfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct inode *inode;
 
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
-	sb->s_blocksize = PAGE_SIZE;
-	sb->s_blocksize_bits = PAGE_SHIFT;
-	sb->s_magic = DFS_MAGIC;
+	sb->s_magic = DFS_SUPER_MAGIC;
+	if (!sb_set_blocksize(sb, DFS_DEFAULT_BLOCK_SIZE))
+		return -EINVAL;
+
+	if (dfs_validate_super(sb))
+		return -EINVAL;
 	sb->s_op = &dfs_ops;
 	sb->s_d_flags = DCACHE_DONTCACHE;
 	sb->s_time_gran = 1;
@@ -186,7 +230,12 @@ static int dfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 static int dfs_get_tree(struct fs_context *fc)
 {
-	return get_tree_nodev(fc, dfs_fill_super);
+	return get_tree_bdev(fc, dfs_fill_super);
+}
+
+static void dfs_kill_sb(struct super_block *sb)
+{
+	kill_block_super(sb);
 }
 
 static const struct fs_context_operations dfs_context_ops = {
@@ -202,7 +251,7 @@ static int dfs_init_fs_context(struct fs_context *fc)
 static struct file_system_type dfs_fs_type = {
 	.name		= "dfs",
 	.init_fs_context = dfs_init_fs_context,
-	.kill_sb	= kill_anon_super,
+	.kill_sb	= dfs_kill_sb,
 	.fs_flags	= FS_USERNS_MOUNT,
 };
 
