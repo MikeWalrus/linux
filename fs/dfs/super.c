@@ -90,46 +90,6 @@ static int dfs_sync_fs(struct super_block *sb, int wait)
 	return 0;
 }
 
-static bool dfs_root_dir_valid(struct inode *inode)
-{
-	struct folio *folio;
-	void *kaddr;
-	struct dfs_dir_entry *de1;
-	struct dfs_dir_entry *de2;
-	unsigned int rec_len1;
-	unsigned int rec_len2;
-
-	if (inode->i_size < 2 * DFS_DIR_REC_LEN(1))
-		return false;
-
-	folio = read_mapping_folio(inode->i_mapping, 0, NULL);
-	if (IS_ERR(folio))
-		return false;
-
-	kaddr = kmap_local_folio(folio, 0);
-	de1 = (struct dfs_dir_entry *)kaddr;
-	rec_len1 = le16_to_cpu(de1->rec_len);
-	if (!rec_len1 || rec_len1 > inode->i_sb->s_blocksize)
-		goto invalid;
-	de2 = (struct dfs_dir_entry *)(kaddr + rec_len1);
-	rec_len2 = le16_to_cpu(de2->rec_len);
-	if (!rec_len2 || rec_len1 + rec_len2 > inode->i_sb->s_blocksize)
-		goto invalid;
-	if (de1->name_len != 1 || de1->name[0] != '.')
-		goto invalid;
-	if (de2->name_len != 2 || de2->name[0] != '.' || de2->name[1] != '.')
-		goto invalid;
-
-	kunmap_local(kaddr);
-	folio_put(folio);
-	return true;
-
-invalid:
-	kunmap_local(kaddr);
-	folio_put(folio);
-	return false;
-}
-
 static int dfs_validate_super(struct super_block *sb)
 {
 	struct folio *folio;

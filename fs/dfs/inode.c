@@ -6,433 +6,317 @@
 #include <linux/string.h>
 #include <linux/ramfs.h>
 #include <linux/slab.h>
-#include <linux/dirent.h>
 #include <linux/iomap.h>
 #include <linux/blkdev.h>
+#include <linux/writeback.h>
+#include <linux/time64.h>
+#include <linux/mm.h>
+#include <linux/sched.h>
 
 #include "internal.h"
 
 static const struct inode_operations dfs_dir_inode_operations;
 static const struct file_operations dfs_dir_operations;
 
-static unsigned int dfs_dir_rec_len(unsigned int name_len)
+static struct dfs_inode_info *dfs_inode_info(struct inode *inode)
 {
-	return ALIGN(DFS_DIR_REC_LEN(name_len), 4);
+	return inode->i_private;
 }
 
-static unsigned int dfs_last_byte(struct inode *inode, unsigned long index)
+int dfs_read_inode_disk(struct super_block *sb, u32 ino,
+			 struct dfs_disk_inode *out)
 {
-	loff_t size = inode->i_size;
-	loff_t offset = (loff_t)index << PAGE_SHIFT;
-
-	if (offset >= size)
-		return 0;
-	if (size - offset > PAGE_SIZE)
-		return PAGE_SIZE;
-	return size - offset;
-}
-
-static umode_t dfs_dtype_to_mode(u8 dtype)
-{
-	switch (dtype) {
-	case DT_DIR:
-		return S_IFDIR;
-	case DT_REG:
-		return S_IFREG;
-	case DT_LNK:
-		return S_IFLNK;
-	case DT_CHR:
-		return S_IFCHR;
-	case DT_BLK:
-		return S_IFBLK;
-	case DT_FIFO:
-		return S_IFIFO;
-	case DT_SOCK:
-		return S_IFSOCK;
-	default:
-		return S_IFREG;
-	}
-}
-
-static bool dfs_dirent_valid(struct dfs_dir_entry *de, unsigned int remaining)
-{
-	unsigned int rec_len = le16_to_cpu(de->rec_len);
-	unsigned int min_len;
-
-	if (!rec_len || rec_len > remaining)
-		return false;
-	if (de->name_len > DFS_DIRENT_NAME_MAX)
-		return false;
-	min_len = dfs_dir_rec_len(de->name_len);
-	if (rec_len < min_len)
-		return false;
-	return true;
-}
-
-static int dfs_readdir(struct file *file, struct dir_context *ctx)
-{
-	struct inode *inode = file_inode(file);
-	loff_t pos = ctx->pos;
-
-	if (pos >= inode->i_size)
-		return 0;
-
-	while (pos < inode->i_size) {
-		unsigned long index = pos >> PAGE_SHIFT;
-		unsigned int offset = pos & (PAGE_SIZE - 1);
-		unsigned int limit = dfs_last_byte(inode, index);
-		struct folio *folio;
-		void *kaddr;
-
-		if (!limit)
-			break;
-
-		folio = read_mapping_folio(inode->i_mapping, index, NULL);
-		if (IS_ERR(folio))
-			return PTR_ERR(folio);
-
-		kaddr = kmap_local_folio(folio, 0);
-
-		while (offset + sizeof(struct dfs_dir_entry) <= limit) {
-			struct dfs_dir_entry *de = (struct dfs_dir_entry *)(kaddr + offset);
-			unsigned int remaining = limit - offset;
-			unsigned int rec_len;
-			unsigned int ino;
-			unsigned char d_type;
-
-			if (!dfs_dirent_valid(de, remaining)) {
-				dfs_info("find_entry invalid dir=%lu pos=%lld rem=%u rec_len=%u name_len=%u\n",
-					 inode->i_ino, pos, remaining,
-					 le16_to_cpu(de->rec_len), de->name_len);
-				kunmap_local(kaddr);
-				folio_put(folio);
-				return -EIO;
-			}
-
-			rec_len = le16_to_cpu(de->rec_len);
-			ino = le32_to_cpu(de->ino);
-			if (ino) {
-				d_type = fs_ftype_to_dtype(de->file_type);
-				if (!dir_emit(ctx, de->name, de->name_len, ino,
-					      d_type)) {
-					kunmap_local(kaddr);
-					folio_put(folio);
-					return 0;
-				}
-			}
-
-			pos += rec_len;
-			offset += rec_len;
-			ctx->pos = pos;
-			if (pos >= inode->i_size)
-				break;
-		}
-
-		kunmap_local(kaddr);
-		folio_put(folio);
-		if (offset >= PAGE_SIZE)
-			continue;
-		if (pos < inode->i_size)
-			pos = (loff_t)(index + 1) << PAGE_SHIFT;
-		ctx->pos = pos;
-	}
-
-	return 0;
-}
-
-static int dfs_find_entry(struct inode *dir, const struct qstr *name,
-			  loff_t *pos_out, u16 *rec_len_out,
-			  u32 *ino_out, u8 *type_out)
-{
-	loff_t pos = 0;
-
-	while (pos < dir->i_size) {
-		unsigned long index = pos >> PAGE_SHIFT;
-		unsigned int offset = pos & (PAGE_SIZE - 1);
-		unsigned int limit = dfs_last_byte(dir, index);
-		struct folio *folio;
-		void *kaddr;
-
-		if (!limit)
-			break;
-
-		folio = read_mapping_folio(dir->i_mapping, index, NULL);
-		if (IS_ERR(folio))
-			return PTR_ERR(folio);
-
-		kaddr = kmap_local_folio(folio, 0);
-		while (offset + sizeof(struct dfs_dir_entry) <= limit) {
-			struct dfs_dir_entry *de = (struct dfs_dir_entry *)(kaddr + offset);
-			unsigned int remaining = limit - offset;
-			unsigned int rec_len;
-
-			if (!dfs_dirent_valid(de, remaining)) {
-				dfs_info("find_entry invalid dir=%lu pos=%lld rem=%u rec_len=%u name_len=%u\n",
-					 dir->i_ino, pos, remaining,
-					 le16_to_cpu(de->rec_len), de->name_len);
-				kunmap_local(kaddr);
-				folio_put(folio);
-				return -EIO;
-			}
-
-			rec_len = le16_to_cpu(de->rec_len);
-			if (le32_to_cpu(de->ino) &&
-			    de->name_len == name->len &&
-			    !memcmp(de->name, name->name, name->len)) {
-				*pos_out = pos;
-				*rec_len_out = rec_len;
-				*ino_out = le32_to_cpu(de->ino);
-				*type_out = de->file_type;
-				dfs_info("lookup hit dir=%lu name=%.*s ino=%u type=%u\n",
-					 dir->i_ino, name->len, name->name, *ino_out, *type_out);
-				kunmap_local(kaddr);
-				folio_put(folio);
-				return 0;
-			}
-
-			pos += rec_len;
-			offset += rec_len;
-			if (pos >= dir->i_size)
-				break;
-		}
-		kunmap_local(kaddr);
-		folio_put(folio);
-		if (offset >= PAGE_SIZE)
-			continue;
-		pos = (loff_t)(index + 1) << PAGE_SHIFT;
-	}
-
-	return -ENOENT;
-}
-
-static int dfs_write_dirent(struct inode *dir, loff_t pos, u16 rec_len,
-			    const struct qstr *name, struct inode *inode)
-{
-	unsigned long index = pos >> PAGE_SHIFT;
-	unsigned int offset = pos & (PAGE_SIZE - 1);
+	struct address_space *mapping;
 	struct folio *folio;
+	loff_t offset;
+	pgoff_t index;
+	unsigned int page_off;
 	void *kaddr;
-	struct dfs_dir_entry *de;
+	int ret;
 
-	folio = filemap_grab_folio(dir->i_mapping, index);
+	if (!sb || !sb->s_bdev)
+		return -EINVAL;
+	if (!out)
+		return -EINVAL;
+
+	ret = dfs_inode_disk_location(sb, ino, &offset, &index, &page_off);
+	if (ret)
+		return ret;
+
+	mapping = sb->s_bdev->bd_mapping;
+	folio = read_mapping_folio(mapping, index, NULL);
 	if (IS_ERR(folio))
 		return PTR_ERR(folio);
 
 	kaddr = kmap_local_folio(folio, 0);
-	de = (struct dfs_dir_entry *)(kaddr + offset);
-	memset(de, 0, rec_len);
-	if (inode) {
-		de->ino = cpu_to_le32(inode->i_ino);
-		de->name_len = name->len;
-		de->file_type = fs_umode_to_ftype(inode->i_mode);
-		memcpy(de->name, name->name, name->len);
+	memcpy(out, kaddr + page_off, sizeof(*out));
+	kunmap_local(kaddr);
+	folio_put(folio);
+	dfs_info("read inode=%u offset=%lld mode=0%o size=%llu base=%llu disk_ino=%u\n",
+		 ino, offset, le32_to_cpu(out->mode),
+		 (unsigned long long)le64_to_cpu(out->size),
+		 (unsigned long long)le64_to_cpu(out->base),
+		 le32_to_cpu(out->ino));
+	return 0;
+}
+
+int dfs_write_inode(struct inode *inode, struct writeback_control *wbc)
+{
+	struct super_block *sb = inode->i_sb;
+	struct dfs_inode_info *di = dfs_inode_info(inode);
+	int sync_mode = wbc ? wbc->sync_mode : -1;
+	struct address_space *mapping;
+	struct folio *folio;
+	loff_t offset;
+	pgoff_t index;
+	unsigned int page_off;
+	void *kaddr;
+	struct dfs_disk_inode *disk;
+	int ret;
+
+	dfs_info("write_inode enter ino=%lu sync_mode=%d di=%p\n",
+		 inode->i_ino, sync_mode, di);
+
+	if (!sb || !sb->s_bdev || !di) {
+		dfs_info("write_inode skip ino=%lu sb=%p bdev=%p di=%p\n",
+			 inode->i_ino, sb, sb ? sb->s_bdev : NULL, di);
+		return -EIO;
 	}
-	de->rec_len = cpu_to_le16(rec_len);
+
+	if (inode->i_ino == 0)
+		return 0;
+
+	ret = dfs_inode_disk_location(sb, inode->i_ino, &offset, &index, &page_off);
+	if (ret)
+		return ret;
+
+	mapping = sb->s_bdev->bd_mapping;
+	folio = filemap_grab_folio(mapping, index);
+	if (IS_ERR(folio))
+		return PTR_ERR(folio);
+	if (!folio_test_uptodate(folio)) {
+		folio_unlock(folio);
+		folio_put(folio);
+		folio = read_mapping_folio(mapping, index, NULL);
+		if (IS_ERR(folio))
+			return PTR_ERR(folio);
+		folio_lock(folio);
+	}
+
+	kaddr = kmap_local_folio(folio, 0);
+	disk = (struct dfs_disk_inode *)(kaddr + page_off);
+	memset(disk, 0, DFS_INODE_SIZE);
+	disk->ino = cpu_to_le32(inode->i_ino);
+	disk->base = cpu_to_le64(di->base);
+	disk->mode = cpu_to_le32(inode->i_mode);
+	disk->nlink = cpu_to_le32(inode->i_nlink);
+	disk->size = cpu_to_le64(i_size_read(inode));
+	disk->uid = cpu_to_le32(i_uid_read(inode));
+	disk->gid = cpu_to_le32(i_gid_read(inode));
+	disk->flags = cpu_to_le32(0);
+	disk->generation = cpu_to_le32(inode->i_generation);
+	{
+		struct timespec64 ts;
+
+		ts = inode_get_atime(inode);
+		disk->atime_ns = cpu_to_le64(timespec64_to_ns(&ts));
+		ts = inode_get_ctime(inode);
+		disk->ctime_ns = cpu_to_le64(timespec64_to_ns(&ts));
+		disk->btime_ns = cpu_to_le64(0);
+		ts = inode_get_mtime(inode);
+		disk->mtime_ns = cpu_to_le64(timespec64_to_ns(&ts));
+	}
+
 	flush_dcache_folio(folio);
 	folio_mark_uptodate(folio);
 	kunmap_local(kaddr);
-	iomap_dirty_folio(dir->i_mapping, folio);
+	folio_mark_dirty(folio);
 	folio_unlock(folio);
 	folio_put(folio);
 
-	if (pos + rec_len > dir->i_size)
-		i_size_write(dir, pos + rec_len);
-	mark_inode_dirty(dir);
-	filemap_fdatawrite_range(dir->i_mapping, pos, pos + rec_len - 1);
-	filemap_fdatawait_range(dir->i_mapping, pos, pos + rec_len - 1);
-	dfs_info("write dirent dir=%lu pos=%lld rec_len=%u ino=%lu size=%lld\n",
-		 dir->i_ino, pos, rec_len, inode ? inode->i_ino : 0,
-		 dir->i_size);
+	if (wbc && wbc->sync_mode == WB_SYNC_ALL)
+		filemap_fdatawrite_range(mapping, offset,
+					 offset + DFS_INODE_SIZE - 1);
+	if (wbc && wbc->sync_mode == WB_SYNC_ALL)
+		filemap_fdatawait_range(mapping, offset,
+					 offset + DFS_INODE_SIZE - 1);
+
+	dfs_info("write inode=%lu offset=%lld size=%llu mode=0%o nlink=%u base=%llu\n",
+		 inode->i_ino, offset, i_size_read(inode), inode->i_mode,
+		 inode->i_nlink, (unsigned long long)di->base);
+
 	return 0;
 }
 
-static int dfs_add_entry(struct inode *dir, const struct qstr *name,
-			 struct inode *inode)
+static int dfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
+			   unsigned int flags, struct iomap *iomap,
+			   struct iomap *srcmap)
 {
-	loff_t pos = 0;
-	unsigned int rec_len = dfs_dir_rec_len(name->len);
-
-	while (pos < dir->i_size) {
-		unsigned long index = pos >> PAGE_SHIFT;
-		unsigned int offset = pos & (PAGE_SIZE - 1);
-		unsigned int limit = dfs_last_byte(dir, index);
-		struct folio *folio;
-		void *kaddr;
-
-		if (!limit)
-			break;
-
-		folio = read_mapping_folio(dir->i_mapping, index, NULL);
-		if (IS_ERR(folio))
-			return PTR_ERR(folio);
-
-		kaddr = kmap_local_folio(folio, 0);
-		while (offset + sizeof(struct dfs_dir_entry) <= limit) {
-			struct dfs_dir_entry *de = (struct dfs_dir_entry *)(kaddr + offset);
-			unsigned int remaining = limit - offset;
-			unsigned int slot_len;
-			unsigned int min_len;
-
-			if (!dfs_dirent_valid(de, remaining)) {
-				kunmap_local(kaddr);
-				folio_put(folio);
-				return -EIO;
-			}
-
-			slot_len = le16_to_cpu(de->rec_len);
-			min_len = dfs_dir_rec_len(de->name_len);
-			if (le32_to_cpu(de->ino) && slot_len >= min_len + rec_len) {
-				loff_t new_pos = pos + min_len;
-				u16 new_len = slot_len - min_len;
-
-				dfs_info("split dirent dir=%lu pos=%lld slot=%u min=%u new_len=%u\n",
-					 dir->i_ino, pos, slot_len, min_len, new_len);
-				de->rec_len = cpu_to_le16(min_len);
-				flush_dcache_folio(folio);
-				folio_mark_uptodate(folio);
-				iomap_dirty_folio(dir->i_mapping, folio);
-				kunmap_local(kaddr);
-				folio_put(folio);
-				filemap_fdatawrite_range(dir->i_mapping, pos,
-							pos + min_len - 1);
-				filemap_fdatawait_range(dir->i_mapping, pos,
-							pos + min_len - 1);
-				return dfs_write_dirent(dir, new_pos, new_len, name, inode);
-			}
-			if (!de->ino && slot_len >= rec_len) {
-				dfs_info("reuse empty dirent dir=%lu pos=%lld slot=%u\n",
-					 dir->i_ino, pos, slot_len);
-				kunmap_local(kaddr);
-				folio_put(folio);
-				return dfs_write_dirent(dir, pos, slot_len, name, inode);
-			}
-
-			pos += slot_len;
-			offset += slot_len;
-			if (pos >= dir->i_size)
-				break;
-		}
-		kunmap_local(kaddr);
-		folio_put(folio);
-		if (offset >= PAGE_SIZE)
-			continue;
-		pos = (loff_t)(index + 1) << PAGE_SHIFT;
-	}
-
-	{
-		loff_t end = dir->i_size;
-		unsigned int block_off = end & (dir->i_sb->s_blocksize - 1);
-		unsigned int rem = dir->i_sb->s_blocksize - block_off;
-		unsigned int fill = rem ? rem : dir->i_sb->s_blocksize;
-
-		dfs_info("append dirent dir=%lu pos=%lld len=%u fill=%u\n",
-			 dir->i_ino, end, rec_len, fill);
-		return dfs_write_dirent(dir, end, max_t(unsigned int, rec_len, fill),
-					name, inode);
-	}
-}
-
-static int dfs_delete_entry(struct inode *dir, const struct qstr *name)
-{
-	loff_t pos;
-	u16 rec_len;
-	u32 ino;
-	u8 type;
+	struct dfs_inode_info *di = dfs_inode_info(inode);
+	struct super_block *sb = inode->i_sb;
+	loff_t isize = i_size_read(inode);
+	loff_t start;
+	loff_t map_len;
+	u64 addr;
 	int ret;
-	struct qstr empty = QSTR_INIT("", 0);
 
-	ret = dfs_find_entry(dir, name, &pos, &rec_len, &ino, &type);
+	ret = dfs_map_file_range(inode, offset, length, &start, &map_len, &addr);
 	if (ret)
 		return ret;
 
-	return dfs_write_dirent(dir, pos, rec_len, &empty, NULL);
-}
+	iomap->bdev = sb->s_bdev;
+	iomap->offset = start;
+	iomap->addr = addr;
+	iomap->length = map_len;
 
-int dfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
-		 struct iattr *attr)
-{
-	struct inode *inode = d_inode(dentry);
-	int ret;
-
-	ret = simple_setattr(idmap, dentry, attr);
-	if (ret)
-		return ret;
-	dfs_info("setattr ino=%lu size=%lld mode=0%o\n",
-		 inode->i_ino, inode->i_size, inode->i_mode);
-
-	mark_inode_dirty(inode);
-	dfs_schedule_commit(inode->i_sb);
-	return 0;
-}
-
-int dfs_make_empty(struct inode *inode, struct inode *parent)
-{
-	unsigned int rec_len1 = dfs_dir_rec_len(1);
-	unsigned int rec_len2 = inode->i_sb->s_blocksize - rec_len1;
-	struct qstr dot = QSTR_INIT(".", 1);
-	struct qstr dotdot = QSTR_INIT("..", 2);
-	int ret;
-
-	i_size_write(inode, 0);
-	ret = dfs_write_dirent(inode, 0, rec_len1, &dot, inode);
-	if (ret)
-		return ret;
-	return dfs_write_dirent(inode, rec_len1, rec_len2, &dotdot, parent);
-}
-
-static int dfs_empty_dir(struct inode *inode)
-{
-	loff_t pos = 0;
-
-	while (pos < inode->i_size) {
-		unsigned long index = pos >> PAGE_SHIFT;
-		unsigned int offset = pos & (PAGE_SIZE - 1);
-		unsigned int limit = dfs_last_byte(inode, index);
-		struct folio *folio;
-		void *kaddr;
-
-		if (!limit)
-			break;
-		folio = read_mapping_folio(inode->i_mapping, index, NULL);
-		if (IS_ERR(folio))
+	if (!(flags & IOMAP_WRITE)) {
+		if (offset >= isize) {
+			iomap->type = IOMAP_HOLE;
+			iomap->offset = offset;
+			iomap->addr = IOMAP_NULL_ADDR;
+			iomap->length = length;
 			return 0;
-		kaddr = kmap_local_folio(folio, 0);
-		while (offset + sizeof(struct dfs_dir_entry) <= limit) {
-			struct dfs_dir_entry *de = (struct dfs_dir_entry *)(kaddr + offset);
-			unsigned int remaining = limit - offset;
-			unsigned int rec_len;
-
-			if (!dfs_dirent_valid(de, remaining)) {
-				kunmap_local(kaddr);
-				folio_put(folio);
-				return 0;
-			}
-
-			rec_len = le16_to_cpu(de->rec_len);
-			if (le32_to_cpu(de->ino)) {
-				if (de->name_len > 2 ||
-				    (de->name_len == 1 && de->name[0] != '.') ||
-				    (de->name_len == 2 &&
-				     (de->name[0] != '.' || de->name[1] != '.'))) {
-					kunmap_local(kaddr);
-					folio_put(folio);
-					return 0;
-				}
-			}
-			pos += rec_len;
-			offset += rec_len;
-			if (pos >= inode->i_size)
-				break;
 		}
-		kunmap_local(kaddr);
-		folio_put(folio);
-		if (offset >= PAGE_SIZE)
-			continue;
-		pos = (loff_t)(index + 1) << PAGE_SHIFT;
+		if (start >= isize) {
+			iomap->type = IOMAP_HOLE;
+			iomap->addr = IOMAP_NULL_ADDR;
+			return 0;
+		}
+		iomap->type = IOMAP_MAPPED;
+		iomap->length = min_t(loff_t, iomap->length, isize - start);
+		return 0;
 	}
 
-	return 1;
+	if (!di || offset >= di->chunk_bytes)
+		return -ENOSPC;
+
+	iomap->type = IOMAP_MAPPED;
+	iomap->flags |= IOMAP_F_DIRTY;
+	dfs_info("iomap ino=%lu off=%lld len=%lld\n",
+		 inode->i_ino, offset, iomap->length);
+	return 0;
 }
+
+const struct iomap_ops dfs_iomap_ops = {
+	.iomap_begin = dfs_iomap_begin,
+};
+
+static int dfs_read_folio(struct file *file, struct folio *folio)
+{
+	iomap_bio_read_folio(folio, &dfs_iomap_ops);
+	return 0;
+}
+
+static void dfs_readahead(struct readahead_control *rac)
+{
+	iomap_bio_readahead(rac, &dfs_iomap_ops);
+}
+
+static ssize_t dfs_writeback_range(struct iomap_writepage_ctx *wpc,
+				  struct folio *folio, u64 offset,
+				  unsigned int len, u64 end_pos)
+{
+	if (end_pos <= offset)
+		return len;
+
+	if (offset + len > end_pos)
+		len = end_pos - offset;
+
+	if (offset < wpc->iomap.offset ||
+	    offset >= wpc->iomap.offset + wpc->iomap.length) {
+		int error;
+
+		error = dfs_iomap_begin(wpc->inode, offset, end_pos - offset,
+					 IOMAP_WRITE, &wpc->iomap, NULL);
+		if (error)
+			return error;
+	}
+
+	return iomap_add_to_ioend(wpc, folio, offset, end_pos, len);
+}
+
+static const struct iomap_writeback_ops dfs_writeback_ops = {
+	.writeback_range	= dfs_writeback_range,
+	.writeback_submit	= iomap_ioend_writeback_submit,
+};
+
+static int dfs_writepages(struct address_space *mapping,
+			   struct writeback_control *wbc)
+{
+	struct iomap_writepage_ctx wpc = {
+		.inode	= mapping->host,
+		.wbc	= wbc,
+		.ops	= &dfs_writeback_ops,
+	};
+
+	return iomap_writepages(&wpc);
+}
+
+const struct address_space_operations dfs_aops = {
+	.dirty_folio		= iomap_dirty_folio,
+	.release_folio		= iomap_release_folio,
+	.invalidate_folio	= iomap_invalidate_folio,
+	.read_folio		= dfs_read_folio,
+	.readahead		= dfs_readahead,
+	.writepages		= dfs_writepages,
+	.is_partially_uptodate	= iomap_is_partially_uptodate,
+	.error_remove_folio	= generic_error_remove_folio,
+	.migrate_folio		= filemap_migrate_folio,
+};
+
+void dfs_free_inode(struct inode *inode)
+{
+	kfree(inode->i_private);
+	inode->i_private = NULL;
+}
+
+static unsigned long dfs_get_unmapped_area(struct file *file,
+				 unsigned long addr,
+				 unsigned long len,
+				 unsigned long pgoff,
+				 unsigned long flags)
+{
+	return mm_get_unmapped_area(file, addr, len, pgoff, flags);
+}
+
+static ssize_t dfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	ssize_t ret;
+
+	inode_lock(inode);
+	ret = generic_write_checks(iocb, from);
+	if (ret <= 0)
+		goto out_unlock;
+
+	ret = iomap_file_buffered_write(iocb, from, &dfs_iomap_ops, NULL, NULL);
+out_unlock:
+	inode_unlock(inode);
+	if (ret > 0)
+		ret = generic_write_sync(iocb, ret);
+	if (ret > 0) {
+		mark_inode_dirty(inode);
+		dfs_schedule_commit(inode->i_sb);
+	}
+	dfs_info("write_iter ino=%lu ret=%zd\n", inode->i_ino, ret);
+	return ret;
+}
+
+const struct file_operations dfs_file_operations = {
+	.read_iter	= generic_file_read_iter,
+	.write_iter	= dfs_file_write_iter,
+	.mmap_prepare	= generic_file_mmap_prepare,
+	.fsync		= generic_file_fsync,
+	.splice_read	= filemap_splice_read,
+	.splice_write	= iter_file_splice_write,
+	.llseek		= generic_file_llseek,
+	.get_unmapped_area	= dfs_get_unmapped_area,
+};
+
+const struct inode_operations dfs_file_inode_operations = {
+	.setattr	= dfs_setattr,
+	.getattr	= simple_getattr,
+};
 
 struct inode *dfs_get_inode(struct super_block *sb,
 			    const struct inode *dir,
@@ -531,20 +415,17 @@ struct inode *dfs_iget(struct super_block *sb, u32 ino, umode_t mode)
 	if (!error) {
 		struct dfs_inode_info *di = inode->i_private;
 		u64 base = le64_to_cpu(disk.base);
-		u64 bdev_bytes = bdev_nr_bytes(inode->i_sb->s_bdev);
 		u32 disk_ino = le32_to_cpu(disk.ino);
 		u32 disk_mode = le32_to_cpu(disk.mode);
-		u64 expected_base = di ? (u64)ino * di->chunk_bytes : 0;
 		bool base_ok = di && disk_ino == ino && disk_mode != 0 &&
-				  base != 0 && base < bdev_bytes &&
-				  base % di->chunk_bytes == 0 &&
-				  base == expected_base;
+				  base != 0 &&
+				  dfs_inode_base_valid(inode->i_sb, ino,
+						      base, di->chunk_bytes);
 
-		dfs_info("iget ino=%u disk_ino=%u mode=0%o size=%llu base=%llu expected=%llu valid=%d\n",
+		dfs_info("iget ino=%u disk_ino=%u mode=0%o size=%llu base=%llu valid=%d\n",
 			 ino, disk_ino, disk_mode,
 			 (unsigned long long)le64_to_cpu(disk.size),
-			 (unsigned long long)base,
-			 (unsigned long long)expected_base, base_ok);
+			 (unsigned long long)base, base_ok);
 
 		if (base_ok)
 			di->base = base;

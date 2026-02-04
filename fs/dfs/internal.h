@@ -69,11 +69,31 @@ extern const struct iomap_ops dfs_iomap_ops;
 extern const struct address_space_operations dfs_aops;
 
 u64 dfs_chunk_bytes(struct super_block *sb);
+loff_t dfs_inode_offset(struct super_block *sb, u32 ino);
+int dfs_inode_disk_location(struct super_block *sb, u32 ino,
+				 loff_t *offset, pgoff_t *index,
+				 unsigned int *page_off);
+int dfs_inode_base(struct super_block *sb, u32 ino, u64 *base,
+			   u64 *chunk_bytes);
+bool dfs_inode_base_valid(struct super_block *sb, u32 ino, u64 base,
+			  u64 chunk_bytes);
+int dfs_map_file_range(struct inode *inode, loff_t offset, loff_t length,
+			 loff_t *start_out, loff_t *len_out, u64 *addr_out);
 
 struct inode *dfs_get_inode(struct super_block *sb, const struct inode *dir,
 			    umode_t mode, dev_t dev);
 struct inode *dfs_iget(struct super_block *sb, u32 ino, umode_t mode);
 int dfs_make_empty(struct inode *inode, struct inode *parent);
+int dfs_add_entry(struct inode *dir, const struct qstr *name, struct inode *inode);
+int dfs_delete_entry(struct inode *dir, const struct qstr *name);
+int dfs_empty_dir(struct inode *inode);
+int dfs_find_entry(struct inode *dir, const struct qstr *name,
+			  loff_t *pos_out, u16 *rec_len_out,
+			  u32 *ino_out, u8 *type_out);
+int dfs_readdir(struct file *file, struct dir_context *ctx);
+bool dfs_root_dir_valid(struct inode *inode);
+unsigned int dfs_dir_rec_len(unsigned int name_len);
+umode_t dfs_dtype_to_mode(u8 dtype);
 void dfs_schedule_commit(struct super_block *sb);
 int dfs_alloc_inode_info(struct inode *inode);
 void dfs_free_inode(struct inode *inode);
