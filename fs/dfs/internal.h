@@ -1,10 +1,21 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 
 #include <linux/fs.h>
+#include <linux/workqueue.h>
+
+#define dfs_info(fmt, ...) \
+	pr_debug("dfs: " fmt, ##__VA_ARGS__)
+
+struct iomap_ops;
 
 #define DFS_SUPER_MAGIC 0x00444653
 #define DFS_SUPER_VERSION 1
 #define DFS_DEFAULT_BLOCK_SIZE 4096
+#define DFS_INODE_SIZE 512
+#define DFS_INODE_TABLE_BLOCK 1
+
+#define DFS_DIRENT_NAME_MAX 255
+#define DFS_DIR_REC_LEN(name_len) (sizeof(struct dfs_dir_entry) + (name_len))
 
 struct dfs_super_block {
 	__le32 magic;
@@ -14,6 +25,63 @@ struct dfs_super_block {
 	__le64 created_ns;
 	__le64 reserved[5];
 };
+
+struct dfs_disk_inode {
+	__le32 ino;
+	__le64 base;
+	__le32 mode;
+	__le32 nlink;
+	__le64 size;
+	__le32 uid;
+	__le32 gid;
+	__le32 flags;
+	__le32 generation;
+	__le64 atime_ns;
+	__le64 ctime_ns;
+	__le64 btime_ns;
+	__le64 mtime_ns;
+	__le64 reserved[54];
+	__le32 reserved32;
+} __packed;
+
+struct dfs_dir_entry {
+	__le32 ino;
+	__le16 rec_len;
+	u8 name_len;
+	u8 file_type;
+	char name[];
+} __packed;
+
+struct dfs_sb_info {
+	struct super_block *sb;
+	struct delayed_work commit_work;
+	atomic_t commit_pending;
+	u64 chunk_blocks;
+	atomic_t next_ino;
+};
+
+struct dfs_inode_info {
+	u64 base;
+	u64 chunk_bytes;
+};
+
+extern const struct iomap_ops dfs_iomap_ops;
+extern const struct address_space_operations dfs_aops;
+
+u64 dfs_chunk_bytes(struct super_block *sb);
+
+struct inode *dfs_get_inode(struct super_block *sb, const struct inode *dir,
+			    umode_t mode, dev_t dev);
+struct inode *dfs_iget(struct super_block *sb, u32 ino, umode_t mode);
+int dfs_make_empty(struct inode *inode, struct inode *parent);
+void dfs_schedule_commit(struct super_block *sb);
+int dfs_alloc_inode_info(struct inode *inode);
+void dfs_free_inode(struct inode *inode);
+int dfs_write_inode(struct inode *inode, struct writeback_control *wbc);
+int dfs_read_inode_disk(struct super_block *sb, u32 ino,
+			 struct dfs_disk_inode *out);
+int dfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+		 struct iattr *attr);
 
 extern const struct file_operations dfs_file_operations;
 extern const struct inode_operations dfs_file_inode_operations;

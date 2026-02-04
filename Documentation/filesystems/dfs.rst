@@ -46,6 +46,38 @@ DFS treats the virtualized flash layer as a single-level store:
 The in-tree implementation will refine these ideas into Linux VFS semantics
 and define the concrete on-disk format.
 
+Current Implementation Deltas
+=============================
+
+The in-tree DFS prototype intentionally diverges from the paper in several
+areas while the kernel integration is stabilized. These deltas are tracked
+here to avoid confusion during development:
+
+- **VFSL semantics:** The paper relies on a virtualized flash layer with
+  atomic page updates, allocate/remap, and deallocate. The current prototype
+  runs on a plain block device and uses iomap without VFSL semantics.
+- **Block size:** The paper assumes 512-byte blocks; the prototype uses a
+  4KB block size and writes a 4KB superblock.
+- **Inode numbering/size:** The paper uses 32-bit inode numbers. The kernel
+  inode numbers are 64-bit, but the on-disk inode stores a 32-bit inode
+  field.
+- **Inode table layout:** The paper describes a system file containing the
+  inode array. The prototype writes inode records directly into a fixed inode
+  table starting at block 1.
+- **Chunking policy:** The paper shares chunks for small files and promotes
+  to dedicated chunks for large files. The prototype assigns every inode a
+  fixed 2TB chunk at `base = ino * chunk_bytes` with no small-file sharing
+  or promotion.
+- **Directory durability:** The paper uses a directory log for multi-block
+  operations (e.g., rename). The prototype performs in-place directory
+  updates without a log.
+- **Deallocate/trim:** The paper uses VFSL deallocate for truncate/unlink and
+  sparse reads. The prototype does not issue deallocate/trim operations.
+- **Crash recovery:** The paper relies on VFSL atomicity and allocation logs.
+  The prototype uses delayed `sync_filesystem()` without VFSL recovery.
+- **Direct I/O emphasis:** The paper emphasizes direct I/O. The prototype
+  currently uses buffered iomap paths and generic read helpers.
+
 Virtualized Flash Storage Layer
 ===============================
 
