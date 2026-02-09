@@ -13,6 +13,89 @@ unsigned int dfs_dir_rec_len(unsigned int name_len)
 	return ALIGN(DFS_DIR_REC_LEN(name_len), 4);
 }
 
+static int dfs_dir_folio_read_map(struct address_space *mapping,
+				  unsigned long index,
+				  struct folio **folio_out,
+				  void **kaddr_out)
+{
+	struct folio *folio;
+	struct inode *inode = mapping ? mapping->host : NULL;
+
+	folio = read_mapping_folio(mapping, index, NULL);
+	if (IS_ERR(folio))
+		return PTR_ERR(folio);
+	*folio_out = folio;
+	*kaddr_out = kmap_local_folio(folio, 0);
+	if (inode)
+		dfs_info("dirent map read ino=%lu index=%lu locked=%d\n",
+			 inode->i_ino, index, folio_test_locked(folio));
+	return 0;
+}
+
+static int dfs_dir_folio_grab_map(struct address_space *mapping,
+				  unsigned long index,
+				  struct folio **folio_out,
+				  void **kaddr_out)
+{
+	struct folio *folio;
+	struct inode *inode = mapping ? mapping->host : NULL;
+
+	folio = filemap_grab_folio(mapping, index);
+	if (IS_ERR(folio))
+		return PTR_ERR(folio);
+	*folio_out = folio;
+	*kaddr_out = kmap_local_folio(folio, 0);
+	if (inode)
+		dfs_info("dirent map grab ino=%lu index=%lu locked=%d\n",
+			 inode->i_ino, index, folio_test_locked(folio));
+	return 0;
+}
+
+static void dfs_dir_folio_unmap(struct folio *folio, void *kaddr)
+{
+	struct inode *inode = folio && folio->mapping ? folio->mapping->host : NULL;
+
+	if (inode)
+		dfs_info("dirent unmap ino=%lu index=%lu locked=%d\n",
+			 inode->i_ino, (unsigned long)folio->index,
+			 folio_test_locked(folio));
+	kunmap_local(kaddr);
+	folio_put(folio);
+}
+
+static void dfs_dir_folio_unmap_ptr(struct folio **folio, void **kaddr)
+{
+	if (!folio || !kaddr || !*folio || !*kaddr)
+		return;
+	dfs_dir_folio_unmap(*folio, *kaddr);
+	*folio = NULL;
+	*kaddr = NULL;
+}
+
+static void dfs_dir_folio_mark_dirty(struct address_space *mapping,
+				     struct folio *folio,
+				     void *kaddr,
+				     bool unlock)
+{
+	struct inode *inode = mapping ? mapping->host : NULL;
+
+	if (inode)
+		dfs_info("dirent mark dirty ino=%lu index=%lu unlock=%d\n",
+			 inode->i_ino, (unsigned long)folio->index, unlock);
+	flush_dcache_folio(folio);
+	folio_mark_uptodate(folio);
+	if (unlock) {
+		kunmap_local(kaddr);
+		iomap_dirty_folio(mapping, folio);
+		folio_unlock(folio);
+		folio_put(folio);
+		return;
+	}
+	iomap_dirty_folio(mapping, folio);
+	kunmap_local(kaddr);
+	folio_put(folio);
+}
+
 static unsigned int dfs_last_byte(struct inode *inode, unsigned long index)
 {
 	loff_t size = inode->i_size;
@@ -23,33 +106,6 @@ static unsigned int dfs_last_byte(struct inode *inode, unsigned long index)
 	if (size - offset > PAGE_SIZE)
 		return PAGE_SIZE;
 	return size - offset;
-}
-
-umode_t dfs_dtype_to_mode(u8 dtype)
-{
-	switch (dtype) {
-	case DT_DIR:
-		return S_IFDIR;
-	case DT_REG:
-		return S_IFREG;
-	case DT_LNK:
-		return S_IFLNK;
-	case DT_CHR:
-		return S_IFCHR;
-	case DT_BLK:
-		return S_IFBLK;
-	case DT_FIFO:
-		return S_IFIFO;
-	case DT_SOCK:
-		return S_IFSOCK;
-	default:
-		return S_IFREG;
-	}
-}
-
-umode_t dfs_dirent_mode(u8 file_type)
-{
-	return dfs_dtype_to_mode(fs_ftype_to_dtype(file_type));
 }
 
 static bool dfs_dirent_valid(struct dfs_dir_entry *de, unsigned int remaining)
@@ -71,6 +127,9 @@ int dfs_readdir(struct file *file, struct dir_context *ctx)
 {
 	struct inode *inode = file_inode(file);
 	loff_t pos = ctx->pos;
+	struct folio *folio = NULL;
+	void *kaddr = NULL;
+	int ret = 0;
 
 	if (pos >= inode->i_size)
 		return 0;
@@ -79,17 +138,15 @@ int dfs_readdir(struct file *file, struct dir_context *ctx)
 		unsigned long index = pos >> PAGE_SHIFT;
 		unsigned int offset = pos & (PAGE_SIZE - 1);
 		unsigned int limit = dfs_last_byte(inode, index);
-		struct folio *folio;
-		void *kaddr;
+		int err;
 
 		if (!limit)
 			break;
 
-		folio = read_mapping_folio(inode->i_mapping, index, NULL);
-		if (IS_ERR(folio))
-			return PTR_ERR(folio);
-
-		kaddr = kmap_local_folio(folio, 0);
+		err = dfs_dir_folio_read_map(inode->i_mapping, index,
+					   &folio, &kaddr);
+		if (err)
+			return err;
 
 		while (offset + sizeof(struct dfs_dir_entry) <= limit) {
 			struct dfs_dir_entry *de = (struct dfs_dir_entry *)(kaddr + offset);
@@ -102,9 +159,8 @@ int dfs_readdir(struct file *file, struct dir_context *ctx)
 				dfs_info("find_entry invalid dir=%lu pos=%lld rem=%u rec_len=%u name_len=%u\n",
 					 inode->i_ino, pos, remaining,
 					 le16_to_cpu(de->rec_len), de->name_len);
-				kunmap_local(kaddr);
-				folio_put(folio);
-				return -EIO;
+				ret = -EIO;
+				goto out_unmap;
 			}
 
 			rec_len = le16_to_cpu(de->rec_len);
@@ -113,9 +169,8 @@ int dfs_readdir(struct file *file, struct dir_context *ctx)
 				d_type = fs_ftype_to_dtype(de->file_type);
 				if (!dir_emit(ctx, de->name, de->name_len, ino,
 					      d_type)) {
-					kunmap_local(kaddr);
-					folio_put(folio);
-					return 0;
+					ret = 0;
+					goto out_unmap;
 				}
 			}
 
@@ -126,8 +181,7 @@ int dfs_readdir(struct file *file, struct dir_context *ctx)
 				break;
 		}
 
-		kunmap_local(kaddr);
-		folio_put(folio);
+		dfs_dir_folio_unmap_ptr(&folio, &kaddr);
 		if (offset >= PAGE_SIZE)
 			continue;
 		if (pos < inode->i_size)
@@ -136,6 +190,10 @@ int dfs_readdir(struct file *file, struct dir_context *ctx)
 	}
 
 	return 0;
+
+out_unmap:
+	dfs_dir_folio_unmap_ptr(&folio, &kaddr);
+	return ret;
 }
 
 int dfs_find_entry(struct inode *dir, const struct qstr *name,
@@ -143,22 +201,23 @@ int dfs_find_entry(struct inode *dir, const struct qstr *name,
 			  u32 *ino_out, u8 *type_out)
 {
 	loff_t pos = 0;
+	struct folio *folio = NULL;
+	void *kaddr = NULL;
+	int ret = -ENOENT;
 
 	while (pos < dir->i_size) {
 		unsigned long index = pos >> PAGE_SHIFT;
 		unsigned int offset = pos & (PAGE_SIZE - 1);
 		unsigned int limit = dfs_last_byte(dir, index);
-		struct folio *folio;
-		void *kaddr;
+		int err;
 
 		if (!limit)
 			break;
 
-		folio = read_mapping_folio(dir->i_mapping, index, NULL);
-		if (IS_ERR(folio))
-			return PTR_ERR(folio);
-
-		kaddr = kmap_local_folio(folio, 0);
+		err = dfs_dir_folio_read_map(dir->i_mapping, index,
+					   &folio, &kaddr);
+		if (err)
+			return err;
 		while (offset + sizeof(struct dfs_dir_entry) <= limit) {
 			struct dfs_dir_entry *de = (struct dfs_dir_entry *)(kaddr + offset);
 			unsigned int remaining = limit - offset;
@@ -168,9 +227,8 @@ int dfs_find_entry(struct inode *dir, const struct qstr *name,
 				dfs_info("find_entry invalid dir=%lu pos=%lld rem=%u rec_len=%u name_len=%u\n",
 					 dir->i_ino, pos, remaining,
 					 le16_to_cpu(de->rec_len), de->name_len);
-				kunmap_local(kaddr);
-				folio_put(folio);
-				return -EIO;
+				ret = -EIO;
+				goto out_unmap;
 			}
 
 			rec_len = le16_to_cpu(de->rec_len);
@@ -183,9 +241,8 @@ int dfs_find_entry(struct inode *dir, const struct qstr *name,
 				*type_out = de->file_type;
 				dfs_info("lookup hit dir=%lu name=%.*s ino=%u type=%u\n",
 					 dir->i_ino, name->len, name->name, *ino_out, *type_out);
-				kunmap_local(kaddr);
-				folio_put(folio);
-				return 0;
+				ret = 0;
+				goto out_unmap;
 			}
 
 			pos += rec_len;
@@ -193,15 +250,18 @@ int dfs_find_entry(struct inode *dir, const struct qstr *name,
 			if (pos >= dir->i_size)
 				break;
 		}
-		kunmap_local(kaddr);
-		folio_put(folio);
+		dfs_dir_folio_unmap_ptr(&folio, &kaddr);
 		if (offset >= PAGE_SIZE)
 			continue;
 		if (pos < dir->i_size)
 			pos = (loff_t)(index + 1) << PAGE_SHIFT;
 	}
 
-	return -ENOENT;
+	return ret;
+
+out_unmap:
+	dfs_dir_folio_unmap_ptr(&folio, &kaddr);
+	return ret;
 }
 
 static int dfs_write_dirent(struct inode *dir, loff_t pos, u16 rec_len,
@@ -212,12 +272,11 @@ static int dfs_write_dirent(struct inode *dir, loff_t pos, u16 rec_len,
 	struct folio *folio;
 	void *kaddr;
 	struct dfs_dir_entry *de;
+	int err;
 
-	folio = filemap_grab_folio(dir->i_mapping, index);
-	if (IS_ERR(folio))
-		return PTR_ERR(folio);
-
-	kaddr = kmap_local_folio(folio, 0);
+	err = dfs_dir_folio_grab_map(dir->i_mapping, index, &folio, &kaddr);
+	if (err)
+		return err;
 	de = (struct dfs_dir_entry *)(kaddr + offset);
 	memset(de, 0, rec_len);
 	if (inode) {
@@ -227,12 +286,7 @@ static int dfs_write_dirent(struct inode *dir, loff_t pos, u16 rec_len,
 		memcpy(de->name, name->name, name->len);
 	}
 	de->rec_len = cpu_to_le16(rec_len);
-	flush_dcache_folio(folio);
-	folio_mark_uptodate(folio);
-	kunmap_local(kaddr);
-	iomap_dirty_folio(dir->i_mapping, folio);
-	folio_unlock(folio);
-	folio_put(folio);
+	dfs_dir_folio_mark_dirty(dir->i_mapping, folio, kaddr, true);
 
 	if (pos + rec_len > dir->i_size)
 		i_size_write(dir, pos + rec_len);
@@ -245,22 +299,27 @@ int dfs_add_entry(struct inode *dir, const struct qstr *name,
 {
 	loff_t pos = 0;
 	unsigned int rec_len = dfs_dir_rec_len(name->len);
+	loff_t end;
+	unsigned int block_off;
+	unsigned int rem;
+	unsigned int fill;
+	struct folio *folio = NULL;
+	void *kaddr = NULL;
+	int ret = 0;
 
 	while (pos < dir->i_size) {
 		unsigned long index = pos >> PAGE_SHIFT;
 		unsigned int offset = pos & (PAGE_SIZE - 1);
 		unsigned int limit = dfs_last_byte(dir, index);
-		struct folio *folio;
-		void *kaddr;
+		int err;
 
 		if (!limit)
 			break;
 
-		folio = read_mapping_folio(dir->i_mapping, index, NULL);
-		if (IS_ERR(folio))
-			return PTR_ERR(folio);
-
-		kaddr = kmap_local_folio(folio, 0);
+		err = dfs_dir_folio_read_map(dir->i_mapping, index,
+					   &folio, &kaddr);
+		if (err)
+			return err;
 		while (offset + sizeof(struct dfs_dir_entry) <= limit) {
 			struct dfs_dir_entry *de = (struct dfs_dir_entry *)(kaddr + offset);
 			unsigned int remaining = limit - offset;
@@ -268,9 +327,8 @@ int dfs_add_entry(struct inode *dir, const struct qstr *name,
 			unsigned int min_len;
 
 			if (!dfs_dirent_valid(de, remaining)) {
-				kunmap_local(kaddr);
-				folio_put(folio);
-				return -EIO;
+				ret = -EIO;
+				goto out_unmap;
 			}
 
 			slot_len = le16_to_cpu(de->rec_len);
@@ -282,21 +340,18 @@ int dfs_add_entry(struct inode *dir, const struct qstr *name,
 				dfs_info("split dirent dir=%lu pos=%lld slot=%u min=%u new_len=%u\n",
 					 dir->i_ino, pos, slot_len, min_len, new_len);
 				de->rec_len = cpu_to_le16(min_len);
-				flush_dcache_folio(folio);
-				folio_mark_uptodate(folio);
-				iomap_dirty_folio(dir->i_mapping, folio);
-				kunmap_local(kaddr);
-				folio_put(folio);
-				return dfs_write_dirent(dir, new_pos, new_len,
-							 name, inode);
+				dfs_dir_folio_mark_dirty(dir->i_mapping, folio, kaddr,
+						 false);
+				ret = dfs_write_dirent(dir, new_pos, new_len,
+						 name, inode);
+				goto out_unmap_done;
 			}
 			if (!de->ino && slot_len >= rec_len) {
 				dfs_info("reuse empty dirent dir=%lu pos=%lld slot=%u\n",
 					 dir->i_ino, pos, slot_len);
-				kunmap_local(kaddr);
-				folio_put(folio);
-				return dfs_write_dirent(dir, pos, slot_len,
-							 name, inode);
+				ret = dfs_write_dirent(dir, pos, slot_len,
+						 name, inode);
+				goto out_unmap;
 			}
 
 			pos += slot_len;
@@ -304,25 +359,29 @@ int dfs_add_entry(struct inode *dir, const struct qstr *name,
 			if (pos >= dir->i_size)
 				break;
 		}
-		kunmap_local(kaddr);
-		folio_put(folio);
+		dfs_dir_folio_unmap_ptr(&folio, &kaddr);
 		if (offset >= PAGE_SIZE)
 			continue;
 		pos = (loff_t)(index + 1) << PAGE_SHIFT;
 	}
 
-	{
-		loff_t end = dir->i_size;
-		unsigned int block_off = end & (dir->i_sb->s_blocksize - 1);
-		unsigned int rem = dir->i_sb->s_blocksize - block_off;
-		unsigned int fill = rem ? rem : dir->i_sb->s_blocksize;
+	end = dir->i_size;
+	block_off = end & (dir->i_sb->s_blocksize - 1);
+	rem = dir->i_sb->s_blocksize - block_off;
+	fill = rem ? rem : dir->i_sb->s_blocksize;
 
-		dfs_info("append dirent dir=%lu pos=%lld len=%u fill=%u\n",
-			 dir->i_ino, end, rec_len, fill);
-		return dfs_write_dirent(dir, end,
-					 max_t(unsigned int, rec_len, fill),
-					 name, inode);
-	}
+	dfs_info("append dirent dir=%lu pos=%lld len=%u fill=%u\n",
+		 dir->i_ino, end, rec_len, fill);
+	return dfs_write_dirent(dir, end,
+				 max_t(unsigned int, rec_len, fill),
+				 name, inode);
+
+out_unmap:
+	dfs_dir_folio_unmap_ptr(&folio, &kaddr);
+	return ret;
+
+out_unmap_done:
+	return ret;
 }
 
 int dfs_delete_entry(struct inode *dir, const struct qstr *name)
@@ -359,29 +418,30 @@ int dfs_make_empty(struct inode *inode, struct inode *parent)
 int dfs_empty_dir(struct inode *inode)
 {
 	loff_t pos = 0;
+	struct folio *folio = NULL;
+	void *kaddr = NULL;
+	int ret = 1;
 
 	while (pos < inode->i_size) {
 		unsigned long index = pos >> PAGE_SHIFT;
 		unsigned int offset = pos & (PAGE_SIZE - 1);
 		unsigned int limit = dfs_last_byte(inode, index);
-		struct folio *folio;
-		void *kaddr;
+		int err;
 
 		if (!limit)
 			break;
-		folio = read_mapping_folio(inode->i_mapping, index, NULL);
-		if (IS_ERR(folio))
+		err = dfs_dir_folio_read_map(inode->i_mapping, index,
+					   &folio, &kaddr);
+		if (err)
 			return 0;
-		kaddr = kmap_local_folio(folio, 0);
 		while (offset + sizeof(struct dfs_dir_entry) <= limit) {
 			struct dfs_dir_entry *de = (struct dfs_dir_entry *)(kaddr + offset);
 			unsigned int remaining = limit - offset;
 			unsigned int rec_len;
 
 			if (!dfs_dirent_valid(de, remaining)) {
-				kunmap_local(kaddr);
-				folio_put(folio);
-				return 0;
+				ret = 0;
+				goto out_unmap;
 			}
 
 			rec_len = le16_to_cpu(de->rec_len);
@@ -390,9 +450,8 @@ int dfs_empty_dir(struct inode *inode)
 				    (de->name_len == 1 && de->name[0] != '.') ||
 				    (de->name_len == 2 &&
 				     (de->name[0] != '.' || de->name[1] != '.'))) {
-					kunmap_local(kaddr);
-					folio_put(folio);
-					return 0;
+					ret = 0;
+					goto out_unmap;
 				}
 			}
 			pos += rec_len;
@@ -400,14 +459,17 @@ int dfs_empty_dir(struct inode *inode)
 			if (pos >= inode->i_size)
 				break;
 		}
-		kunmap_local(kaddr);
-		folio_put(folio);
+		dfs_dir_folio_unmap_ptr(&folio, &kaddr);
 		if (offset >= PAGE_SIZE)
 			continue;
 		pos = (loff_t)(index + 1) << PAGE_SHIFT;
 	}
 
 	return 1;
+
+out_unmap:
+	dfs_dir_folio_unmap_ptr(&folio, &kaddr);
+	return ret;
 }
 
 bool dfs_root_dir_valid(struct inode *inode)
@@ -418,15 +480,15 @@ bool dfs_root_dir_valid(struct inode *inode)
 	struct dfs_dir_entry *de2;
 	unsigned int rec_len1;
 	unsigned int rec_len2;
+	int err;
+	bool valid = false;
 
 	if (inode->i_size < 2 * DFS_DIR_REC_LEN(1))
 		return false;
 
-	folio = read_mapping_folio(inode->i_mapping, 0, NULL);
-	if (IS_ERR(folio))
+	err = dfs_dir_folio_read_map(inode->i_mapping, 0, &folio, &kaddr);
+	if (err)
 		return false;
-
-	kaddr = kmap_local_folio(folio, 0);
 	de1 = (struct dfs_dir_entry *)kaddr;
 	rec_len1 = le16_to_cpu(de1->rec_len);
 	if (!rec_len1 || rec_len1 > inode->i_sb->s_blocksize)
@@ -440,12 +502,10 @@ bool dfs_root_dir_valid(struct inode *inode)
 	if (de2->name_len != 2 || de2->name[0] != '.' || de2->name[1] != '.')
 		goto invalid;
 
-	kunmap_local(kaddr);
-	folio_put(folio);
-	return true;
+	dfs_dir_folio_unmap_ptr(&folio, &kaddr);
+	valid = true;
 
 invalid:
-	kunmap_local(kaddr);
-	folio_put(folio);
-	return false;
+	dfs_dir_folio_unmap_ptr(&folio, &kaddr);
+	return valid;
 }

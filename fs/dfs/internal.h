@@ -96,8 +96,6 @@ int dfs_find_entry(struct inode *dir, const struct qstr *name,
 int dfs_readdir(struct file *file, struct dir_context *ctx);
 bool dfs_root_dir_valid(struct inode *inode);
 unsigned int dfs_dir_rec_len(unsigned int name_len);
-umode_t dfs_dtype_to_mode(u8 dtype);
-umode_t dfs_dirent_mode(u8 file_type);
 void dfs_schedule_commit(struct super_block *sb);
 int dfs_alloc_inode_info(struct inode *inode);
 void dfs_free_inode(struct inode *inode);
