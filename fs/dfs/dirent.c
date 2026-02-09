@@ -237,18 +237,6 @@ static int dfs_write_dirent(struct inode *dir, loff_t pos, u16 rec_len,
 	if (pos + rec_len > dir->i_size)
 		i_size_write(dir, pos + rec_len);
 	mark_inode_dirty(dir);
-	dir->i_blkbits = dir->i_sb->s_blocksize_bits;
-	if (dir->i_size >= dir->i_sb->s_blocksize) {
-		loff_t block_start = ALIGN_DOWN(pos, dir->i_sb->s_blocksize);
-		loff_t block_end = block_start + dir->i_sb->s_blocksize - 1;
-
-		dfs_info("dirent writeback dir=%lu pos=%lld rec_len=%u range=%lld..%lld blocksize=%lu\n",
-			 dir->i_ino, pos, rec_len,
-			 block_start, block_end,
-			 dir->i_sb->s_blocksize);
-		/* filemap_fdatawrite_range(dir->i_mapping, block_start, block_end);
-		filemap_fdatawait_range(dir->i_mapping, block_start, block_end); */
-	}
 	return 0;
 }
 
@@ -299,10 +287,6 @@ int dfs_add_entry(struct inode *dir, const struct qstr *name,
 				iomap_dirty_folio(dir->i_mapping, folio);
 				kunmap_local(kaddr);
 				folio_put(folio);
-				filemap_fdatawrite_range(dir->i_mapping, pos,
-							 pos + min_len - 1);
-				filemap_fdatawait_range(dir->i_mapping, pos,
-							 pos + min_len - 1);
 				return dfs_write_dirent(dir, new_pos, new_len,
 							 name, inode);
 			}

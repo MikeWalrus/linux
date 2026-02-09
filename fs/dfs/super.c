@@ -10,12 +10,16 @@
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 #include <linux/writeback.h>
+#include <linux/string.h>
 
 #include "internal.h"
 
 static const struct super_operations dfs_ops;
 static int dfs_sync_fs(struct super_block *sb, int wait);
 static void dfs_dirty_inode(struct inode *inode, int flags);
+static int dfs_read_validate_super(struct super_block *sb,
+				    struct dfs_super_block *out);
+static int dfs_write_super(struct super_block *sb, u32 next_ino, bool wait);
 
 #define DFS_COMMIT_INTERVAL (5 * HZ)
 
@@ -86,16 +90,21 @@ static void dfs_dirty_inode(struct inode *inode, int flags)
 
 static int dfs_sync_fs(struct super_block *sb, int wait)
 {
+	struct dfs_sb_info *sbi = sb->s_fs_info;
+
 	dfs_info("sync_fs wait=%d sb=%pg\n", wait, sb->s_bdev);
+	if (sbi && atomic_xchg(&sbi->super_dirty, 0))
+		dfs_write_super(sb, (u32)atomic_read(&sbi->next_ino), wait != 0);
 	return 0;
 }
 
-static int dfs_validate_super(struct super_block *sb)
+static int dfs_read_validate_super(struct super_block *sb,
+				    struct dfs_super_block *out)
 {
 	struct folio *folio;
 	struct dfs_super_block *disk;
-	int ret = 0;
 	struct address_space *mapping;
+	int ret = 0;
 
 	if (!sb->s_bdev)
 		return -EINVAL;
@@ -114,8 +123,41 @@ static int dfs_validate_super(struct super_block *sb)
 		ret = -EINVAL;
 	else if (le32_to_cpu(disk->flags) != 0)
 		ret = -EOPNOTSUPP;
+	else
+		memcpy(out, disk, sizeof(*out));
 
 	folio_put(folio);
+	return ret;
+}
+
+static int dfs_write_super(struct super_block *sb, u32 next_ino, bool wait)
+{
+	struct folio *folio;
+	struct dfs_super_block *disk;
+	struct address_space *mapping;
+	int ret = 0;
+
+	if (!sb->s_bdev)
+		return -EINVAL;
+
+	mapping = sb->s_bdev->bd_mapping;
+	folio = read_mapping_folio(mapping, 0, NULL);
+	if (IS_ERR(folio))
+		return PTR_ERR(folio);
+
+	disk = (struct dfs_super_block *)folio_address(folio);
+	disk->next_ino = cpu_to_le32(next_ino);
+	flush_dcache_folio(folio);
+	folio_mark_dirty(folio);
+	folio_put(folio);
+
+	if (wait) {
+		loff_t end = sb->s_blocksize - 1;
+
+		ret = filemap_fdatawrite_range(mapping, 0, end);
+		if (!ret)
+			ret = filemap_fdatawait_range(mapping, 0, end);
+	}
 	return ret;
 }
 
@@ -123,14 +165,12 @@ static int dfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct inode *inode;
 	struct dfs_sb_info *sbi;
-	struct dfs_disk_inode disk;
+	struct dfs_disk_inode root_disk;
+	struct dfs_super_block on_disk;
 	int error;
 	int ret = 0;
-	bool have_root = false;
+	bool create_root = false;
 	u64 blocks;
-	u64 bdev_bytes;
-	u64 max_inos;
-	u32 max_ino = 1;
 
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_magic = DFS_SUPER_MAGIC;
@@ -139,7 +179,7 @@ static int dfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	if (sb->s_bdev)
 		invalidate_bdev(sb->s_bdev);
 
-	if (dfs_validate_super(sb))
+	if (dfs_read_validate_super(sb, &on_disk))
 		return -EINVAL;
 
 	dfs_info("mount: dev=%pg blocksize=%lu\n", sb->s_bdev,
@@ -150,47 +190,32 @@ static int dfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		return -ENOMEM;
 	sbi->sb = sb;
 	atomic_set(&sbi->commit_pending, 0);
+	atomic_set(&sbi->super_dirty, 0);
 	INIT_DELAYED_WORK(&sbi->commit_work, dfs_commit_work);
-	atomic_set(&sbi->next_ino, 2);
+	atomic_set(&sbi->next_ino, 1);
 	blocks = div_u64(bdev_nr_bytes(sb->s_bdev), sb->s_blocksize);
 	sbi->chunk_blocks = min_t(u64, 1024, max_t(u64, 1, blocks));
 	sb->s_fs_info = sbi;
 	sb->s_op = &dfs_ops;
-	sb->s_d_flags = DCACHE_DONTCACHE;
+	sb->s_d_flags = 0;
 	sb->s_time_gran = 1;
 
-	bdev_bytes = bdev_nr_bytes(sb->s_bdev);
-	max_inos = div_u64(bdev_bytes, dfs_chunk_bytes(sb));
-	if (max_inos > 1) {
-		u32 ino;
-		u32 empty_streak = 0;
-		u64 scan_limit = min_t(u64, max_inos, 256);
+	{
+		u32 disk_next_ino = le32_to_cpu(on_disk.next_ino);
 
-		for (ino = 1; ino <= scan_limit; ino++) {
-			if (!dfs_read_inode_disk(sb, ino, &disk)) {
-				if (le32_to_cpu(disk.mode) != 0) {
-					max_ino = max(max_ino, ino);
-					empty_streak = 0;
-				} else if (max_ino > 1) {
-					if (++empty_streak >= 32)
-						break;
-				}
-			}
+		if (disk_next_ino < 1)
+			disk_next_ino = 1;
+		atomic_set(&sbi->next_ino, disk_next_ino);
+		create_root = (disk_next_ino == 1);
+	}
+
+	if (!create_root) {
+		error = dfs_read_inode_disk(sb, 1, &root_disk);
+		if (error) {
+			ret = error;
+			goto out_free_sbi;
 		}
-		atomic_set(&sbi->next_ino, max_ino + 1);
-	}
-
-	if (!dfs_read_inode_disk(sb, 1, &disk)) {
-		u32 mode = le32_to_cpu(disk.mode);
-		u64 size = le64_to_cpu(disk.size);
-
-		if (le32_to_cpu(disk.ino) == 1 && mode != 0 && S_ISDIR(mode) &&
-		    size % sb->s_blocksize == 0)
-			have_root = true;
-	}
-
-	if (have_root) {
-		inode = dfs_iget(sb, 1, le32_to_cpu(disk.mode));
+		inode = dfs_iget(sb, 1, le32_to_cpu(root_disk.mode));
 		if (IS_ERR(inode)) {
 			error = PTR_ERR(inode);
 			ret = error;
@@ -211,6 +236,9 @@ static int dfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		error = dfs_make_empty(inode, inode);
 		if (error)
 			goto out_iput;
+		atomic_set(&sbi->next_ino, 2);
+		atomic_set(&sbi->super_dirty, 1);
+		dfs_write_super(sb, 2, true);
 	}
 
 	dfs_info("root inode=%lu\n", inode->i_ino);

@@ -271,9 +271,6 @@ static ssize_t dfs_writeback_range(struct iomap_writepage_ctx *wpc,
 	u64 submit_offset = offset;
 	unsigned int submit_len = len;
 
-	if (wpc->wbc) {
-		(void)wpc->wbc;
-	}
 	wpc->inode->i_blkbits = wpc->inode->i_sb->s_blocksize_bits;
 	if (end_pos <= offset)
 		return len;
@@ -433,8 +430,11 @@ struct inode *dfs_get_inode(struct super_block *sb,
 
 	if (!dir)
 		inode->i_ino = 1;
-	else
+	else {
 		inode->i_ino = (u32)atomic_fetch_inc(&sbi->next_ino);
+		atomic_set(&sbi->super_dirty, 1);
+		dfs_schedule_commit(sb);
+	}
 	insert_inode_hash(inode);
 	inode_init_owner(&nop_mnt_idmap, inode, dir, mode);
 	inode->i_blkbits = sb->s_blocksize_bits;
@@ -592,10 +592,8 @@ static struct dentry *dfs_lookup(struct inode *dir, struct dentry *dentry,
 		return ERR_PTR(-ENAMETOOLONG);
 
 	inode = dfs_lookup_inode(dir, &dentry->d_name);
-	if (inode && !IS_ERR(inode)) {
-		d_add(dentry, inode);
-		return NULL;
-	}
+	if (inode && !IS_ERR(inode))
+		return d_splice_alias(inode, dentry);
 	if (IS_ERR(inode)) {
 		if (PTR_ERR(inode) == -ENOENT) {
 			d_add(dentry, NULL);
@@ -654,8 +652,8 @@ static int dfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 
 	mark_inode_dirty(inode);
 
-	d_make_persistent(dentry, inode);
-	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
+	d_instantiate(dentry, inode);
+	inode_update_time(dir, S_MTIME | S_CTIME);
 	dfs_schedule_commit(dir->i_sb);
 	return 0;
 }
@@ -747,8 +745,8 @@ static int dfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	dfs_info("symlink name=%s ino=%lu dir=%lu\n",
 		 dentry->d_name.name, inode->i_ino, dir->i_ino);
 
-	d_make_persistent(dentry, inode);
-	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
+	d_instantiate(dentry, inode);
+	inode_update_time(dir, S_MTIME | S_CTIME);
 	dfs_schedule_commit(dir->i_sb);
 	return 0;
 }
@@ -766,8 +764,8 @@ static int dfs_link(struct dentry *old_dentry, struct inode *dir,
 	ihold(inode);
 	inc_nlink(inode);
 	inode_set_ctime_current(inode);
-	d_make_persistent(dentry, inode);
-	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
+	d_instantiate(dentry, inode);
+	inode_update_time(dir, S_MTIME | S_CTIME);
 	dfs_schedule_commit(dir->i_sb);
 	return 0;
 }
@@ -786,7 +784,7 @@ static int dfs_unlink(struct inode *dir, struct dentry *dentry)
 
 	drop_nlink(inode);
 	inode_set_ctime_current(inode);
-	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
+	inode_update_time(dir, S_MTIME | S_CTIME);
 	dfs_schedule_commit(dir->i_sb);
 	return 0;
 }
@@ -809,7 +807,7 @@ static int dfs_rmdir(struct inode *dir, struct dentry *dentry)
 	drop_nlink(inode);
 	drop_nlink(dir);
 	inode_set_ctime_current(inode);
-	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
+	inode_update_time(dir, S_MTIME | S_CTIME);
 	dfs_schedule_commit(dir->i_sb);
 	return 0;
 }
@@ -857,10 +855,10 @@ static int dfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 	inode_set_ctime_current(inode);
 	mark_inode_dirty(inode);
 	write_inode_now(inode, 1);
-	inode_set_mtime_to_ts(old_dir, inode_set_ctime_current(old_dir));
+	inode_update_time(old_dir, S_MTIME | S_CTIME);
 	mark_inode_dirty(old_dir);
 	if (old_dir != new_dir)
-		inode_set_mtime_to_ts(new_dir, inode_set_ctime_current(new_dir));
+		inode_update_time(new_dir, S_MTIME | S_CTIME);
 	if (old_dir != new_dir)
 		mark_inode_dirty(new_dir);
 	dfs_schedule_commit(old_dir->i_sb);

@@ -23,7 +23,9 @@ struct dfs_super_block {
 	__le32 block_size;
 	__le32 flags;
 	__le64 created_ns;
-	__le64 reserved[5];
+	__le32 next_ino;
+	__le32 reserved32;
+	__le64 reserved[4];
 };
 
 struct dfs_disk_inode {
@@ -58,6 +60,7 @@ struct dfs_sb_info {
 	atomic_t commit_pending;
 	u64 chunk_blocks;
 	atomic_t next_ino;
+	atomic_t super_dirty;
 };
 
 struct dfs_inode_info {
