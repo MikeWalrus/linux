@@ -128,6 +128,9 @@ static int dfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	int ret = 0;
 	bool have_root = false;
 	u64 blocks;
+	u64 bdev_bytes;
+	u64 max_inos;
+	u32 max_ino = 1;
 
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_magic = DFS_SUPER_MAGIC;
@@ -155,6 +158,27 @@ static int dfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_op = &dfs_ops;
 	sb->s_d_flags = DCACHE_DONTCACHE;
 	sb->s_time_gran = 1;
+
+	bdev_bytes = bdev_nr_bytes(sb->s_bdev);
+	max_inos = div_u64(bdev_bytes, dfs_chunk_bytes(sb));
+	if (max_inos > 1) {
+		u32 ino;
+		u32 empty_streak = 0;
+		u64 scan_limit = min_t(u64, max_inos, 256);
+
+		for (ino = 1; ino <= scan_limit; ino++) {
+			if (!dfs_read_inode_disk(sb, ino, &disk)) {
+				if (le32_to_cpu(disk.mode) != 0) {
+					max_ino = max(max_ino, ino);
+					empty_streak = 0;
+				} else if (max_ino > 1) {
+					if (++empty_streak >= 32)
+						break;
+				}
+			}
+		}
+		atomic_set(&sbi->next_ino, max_ino + 1);
+	}
 
 	if (!dfs_read_inode_disk(sb, 1, &disk)) {
 		u32 mode = le32_to_cpu(disk.mode);

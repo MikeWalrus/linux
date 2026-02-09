@@ -47,6 +47,11 @@ umode_t dfs_dtype_to_mode(u8 dtype)
 	}
 }
 
+umode_t dfs_dirent_mode(u8 file_type)
+{
+	return dfs_dtype_to_mode(fs_ftype_to_dtype(file_type));
+}
+
 static bool dfs_dirent_valid(struct dfs_dir_entry *de, unsigned int remaining)
 {
 	unsigned int rec_len = le16_to_cpu(de->rec_len);
@@ -232,11 +237,18 @@ static int dfs_write_dirent(struct inode *dir, loff_t pos, u16 rec_len,
 	if (pos + rec_len > dir->i_size)
 		i_size_write(dir, pos + rec_len);
 	mark_inode_dirty(dir);
-	filemap_fdatawrite_range(dir->i_mapping, pos, pos + rec_len - 1);
-	filemap_fdatawait_range(dir->i_mapping, pos, pos + rec_len - 1);
-	dfs_info("write dirent dir=%lu pos=%lld rec_len=%u ino=%lu size=%lld\n",
-		 dir->i_ino, pos, rec_len, inode ? inode->i_ino : 0,
-		 dir->i_size);
+	dir->i_blkbits = dir->i_sb->s_blocksize_bits;
+	if (dir->i_size >= dir->i_sb->s_blocksize) {
+		loff_t block_start = ALIGN_DOWN(pos, dir->i_sb->s_blocksize);
+		loff_t block_end = block_start + dir->i_sb->s_blocksize - 1;
+
+		dfs_info("dirent writeback dir=%lu pos=%lld rec_len=%u range=%lld..%lld blocksize=%lu\n",
+			 dir->i_ino, pos, rec_len,
+			 block_start, block_end,
+			 dir->i_sb->s_blocksize);
+		/* filemap_fdatawrite_range(dir->i_mapping, block_start, block_end);
+		filemap_fdatawait_range(dir->i_mapping, block_start, block_end); */
+	}
 	return 0;
 }
 

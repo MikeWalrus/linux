@@ -23,6 +23,35 @@ static struct dfs_inode_info *dfs_inode_info(struct inode *inode)
 	return inode->i_private;
 }
 
+int dfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+{
+	struct inode *inode = file->f_mapping->host;
+	struct block_device *bdev = inode->i_sb ? inode->i_sb->s_bdev : NULL;
+	int err;
+
+	dfs_info("fsync: start=%lld end=%lld datasync=%d inode=%lu\n",
+		 start, end, datasync, inode->i_ino);
+	err = __generic_file_fsync(file, start, end, datasync);
+	if (err)
+		return err;
+	if (!bdev)
+		return 0;
+	dfs_info("fsync: bdev=%pg write_cache=%d synchronous=%d fua=%d\n",
+		 bdev, bdev_write_cache(bdev), bdev_synchronous(bdev), bdev_fua(bdev));
+	if (!bdev_write_cache(bdev) || bdev_synchronous(bdev))
+		return 0;
+
+	err = blkdev_issue_flush(bdev);
+	if (err == -EOPNOTSUPP || err == -EIO) {
+		dfs_info("fsync: flush unsupported on %pg, ignoring err=%d\n",
+			 bdev, err);
+		return 0;
+	}
+	if (err)
+		dfs_info("fsync: flush failed on %pg err=%d\n", bdev, err);
+	return err;
+}
+
 int dfs_read_inode_disk(struct super_block *sb, u32 ino,
 			 struct dfs_disk_inode *out)
 {
@@ -134,12 +163,13 @@ int dfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 	folio_unlock(folio);
 	folio_put(folio);
 
-	if (wbc && wbc->sync_mode == WB_SYNC_ALL)
-		filemap_fdatawrite_range(mapping, offset,
-					 offset + DFS_INODE_SIZE - 1);
-	if (wbc && wbc->sync_mode == WB_SYNC_ALL)
-		filemap_fdatawait_range(mapping, offset,
-					 offset + DFS_INODE_SIZE - 1);
+	if (wbc && wbc->sync_mode == WB_SYNC_ALL) {
+		loff_t block_start = ALIGN_DOWN(offset, inode->i_sb->s_blocksize);
+		loff_t block_end = block_start + inode->i_sb->s_blocksize - 1;
+
+		filemap_fdatawrite_range(mapping, block_start, block_end);
+		filemap_fdatawait_range(mapping, block_start, block_end);
+	}
 
 	dfs_info("write inode=%lu offset=%lld size=%llu mode=0%o nlink=%u base=%llu\n",
 		 inode->i_ino, offset, i_size_read(inode), inode->i_mode,
@@ -160,9 +190,21 @@ static int dfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 	u64 addr;
 	int ret;
 
+	if ((flags & IOMAP_WRITE) && length < sb->s_blocksize)
+		length = sb->s_blocksize;
+
 	ret = dfs_map_file_range(inode, offset, length, &start, &map_len, &addr);
-	if (ret)
+	if (ret) {
+		pr_err("dfs: map_file_range failed ino=%lu off=%lld len=%lld flags=0x%x ret=%d\n",
+		       inode->i_ino, offset, length, flags, ret);
+		if (flags & IOMAP_WRITE)
+			BUG();
 		return ret;
+	}
+
+	dfs_info("iomap_begin ino=%lu flags=0x%x off=%lld len=%lld start=%lld map_len=%lld addr=%llu\n",
+		 inode->i_ino, flags, offset, length, start, map_len,
+		 (unsigned long long)addr);
 
 	iomap->bdev = sb->s_bdev;
 	iomap->offset = start;
@@ -171,6 +213,8 @@ static int dfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 
 	if (!(flags & IOMAP_WRITE)) {
 		if (offset >= isize) {
+			dfs_info("iomap_begin hole ino=%lu off=%lld len=%lld isize=%lld\n",
+				 inode->i_ino, offset, length, isize);
 			iomap->type = IOMAP_HOLE;
 			iomap->offset = offset;
 			iomap->addr = IOMAP_NULL_ADDR;
@@ -178,6 +222,8 @@ static int dfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 			return 0;
 		}
 		if (start >= isize) {
+			dfs_info("iomap_begin hole ino=%lu start=%lld isize=%lld\n",
+				 inode->i_ino, start, isize);
 			iomap->type = IOMAP_HOLE;
 			iomap->addr = IOMAP_NULL_ADDR;
 			return 0;
@@ -187,8 +233,13 @@ static int dfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 		return 0;
 	}
 
-	if (!di || offset >= di->chunk_bytes)
+	if (!di || offset >= di->chunk_bytes) {
+		pr_err("dfs: write iomap out of range ino=%lu off=%lld chunk_bytes=%llu\n",
+		       inode->i_ino, offset,
+		       di ? (unsigned long long)di->chunk_bytes : 0ULL);
+		BUG();
 		return -ENOSPC;
+	}
 
 	iomap->type = IOMAP_MAPPED;
 	iomap->flags |= IOMAP_F_DIRTY;
@@ -216,23 +267,49 @@ static ssize_t dfs_writeback_range(struct iomap_writepage_ctx *wpc,
 				  struct folio *folio, u64 offset,
 				  unsigned int len, u64 end_pos)
 {
+	unsigned long blocksize = wpc->inode->i_sb->s_blocksize;
+	u64 submit_offset = offset;
+	unsigned int submit_len = len;
+
+	if (wpc->wbc) {
+		(void)wpc->wbc;
+	}
+	wpc->inode->i_blkbits = wpc->inode->i_sb->s_blocksize_bits;
 	if (end_pos <= offset)
 		return len;
 
 	if (offset + len > end_pos)
 		len = end_pos - offset;
 
-	if (offset < wpc->iomap.offset ||
-	    offset >= wpc->iomap.offset + wpc->iomap.length) {
-		int error;
-
-		error = dfs_iomap_begin(wpc->inode, offset, end_pos - offset,
-					 IOMAP_WRITE, &wpc->iomap, NULL);
-		if (error)
-			return error;
+	if (len && len < blocksize) {
+		submit_offset = ALIGN_DOWN(offset, blocksize);
+		submit_len = blocksize;
+		dfs_info("writeback_range expand io ino=%lu off=%llu->%llu len=%u->%u\n",
+			 wpc->inode->i_ino,
+			 (unsigned long long)offset,
+			 (unsigned long long)submit_offset,
+			 len,
+			 submit_len);
 	}
 
-	return iomap_add_to_ioend(wpc, folio, offset, end_pos, len);
+	if (submit_offset < wpc->iomap.offset ||
+	    submit_offset >= wpc->iomap.offset + wpc->iomap.length) {
+		int error;
+
+		error = dfs_iomap_begin(wpc->inode, submit_offset, submit_len,
+					 IOMAP_WRITE, &wpc->iomap, NULL);
+		if (error) {
+			pr_err("dfs: writeback iomap_begin failed ino=%lu off=%llu end=%llu err=%d\n",
+			       wpc->inode->i_ino,
+			       (unsigned long long)submit_offset,
+			       (unsigned long long)end_pos, error);
+			BUG();
+			return error;
+		}
+	}
+
+	iomap_add_to_ioend(wpc, folio, submit_offset, end_pos, submit_len);
+	return len;
 }
 
 static const struct iomap_writeback_ops dfs_writeback_ops = {
@@ -248,6 +325,11 @@ static int dfs_writepages(struct address_space *mapping,
 		.wbc	= wbc,
 		.ops	= &dfs_writeback_ops,
 	};
+
+	mapping->host->i_blkbits = mapping->host->i_sb->s_blocksize_bits;
+
+	if (wbc)
+		(void)wbc;
 
 	return iomap_writepages(&wpc);
 }
@@ -295,18 +377,33 @@ out_unlock:
 	if (ret > 0)
 		ret = generic_write_sync(iocb, ret);
 	if (ret > 0) {
+		inode_set_mtime_to_ts(inode, current_time(inode));
+		inode_set_ctime_current(inode);
 		mark_inode_dirty(inode);
 		dfs_schedule_commit(inode->i_sb);
+		sync_inode_metadata(inode, 1);
 	}
 	dfs_info("write_iter ino=%lu ret=%zd\n", inode->i_ino, ret);
 	return ret;
 }
 
+static ssize_t dfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	ssize_t ret = generic_file_read_iter(iocb, to);
+
+	if (ret > 0) {
+		file_accessed(iocb->ki_filp);
+		sync_inode_metadata(inode, 1);
+	}
+	return ret;
+}
+
 const struct file_operations dfs_file_operations = {
-	.read_iter	= generic_file_read_iter,
+	.read_iter	= dfs_file_read_iter,
 	.write_iter	= dfs_file_write_iter,
 	.mmap_prepare	= generic_file_mmap_prepare,
-	.fsync		= generic_file_fsync,
+	.fsync		= dfs_fsync,
 	.splice_read	= filemap_splice_read,
 	.splice_write	= iter_file_splice_write,
 	.llseek		= generic_file_llseek,
@@ -340,6 +437,7 @@ struct inode *dfs_get_inode(struct super_block *sb,
 		inode->i_ino = (u32)atomic_fetch_inc(&sbi->next_ino);
 	insert_inode_hash(inode);
 	inode_init_owner(&nop_mnt_idmap, inode, dir, mode);
+	inode->i_blkbits = sb->s_blocksize_bits;
 	inode->i_mapping->a_ops = &dfs_aops;
 	mapping_set_gfp_mask(inode->i_mapping, GFP_HIGHUSER);
 	mapping_set_unevictable(inode->i_mapping);
@@ -386,6 +484,7 @@ struct inode *dfs_iget(struct super_block *sb, u32 ino, umode_t mode)
 		return inode;
 
 	inode_init_owner(&nop_mnt_idmap, inode, NULL, mode);
+	inode->i_blkbits = sb->s_blocksize_bits;
 	inode->i_mapping->a_ops = &dfs_aops;
 	mapping_set_gfp_mask(inode->i_mapping, GFP_HIGHUSER);
 	mapping_set_unevictable(inode->i_mapping);
@@ -462,6 +561,7 @@ static struct inode *dfs_lookup_inode(struct inode *dir,
 	u16 rec_len;
 	u32 ino;
 	u8 type;
+	struct dfs_disk_inode disk;
 	umode_t mode;
 	int ret;
 
@@ -472,7 +572,13 @@ static struct inode *dfs_lookup_inode(struct inode *dir,
 		return ERR_PTR(ret);
 	}
 
-	mode = dfs_dtype_to_mode(type) | 0644;
+	ret = dfs_read_inode_disk(dir->i_sb, ino, &disk);
+	if (ret)
+		return ERR_PTR(ret);
+
+	mode = le32_to_cpu(disk.mode);
+	if (!(mode & S_IFMT))
+		return ERR_PTR(-EUCLEAN);
 
 	return dfs_iget(dir->i_sb, ino, mode);
 }
@@ -551,6 +657,39 @@ static int dfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	d_make_persistent(dentry, inode);
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 	dfs_schedule_commit(dir->i_sb);
+	return 0;
+}
+
+int dfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+		 struct iattr *attr)
+{
+	struct inode *inode = d_inode(dentry);
+	int ret;
+
+	ret = setattr_prepare(idmap, dentry, attr);
+	if (ret)
+		return ret;
+
+	if (attr->ia_valid & ATTR_SIZE) {
+		ret = inode_newsize_ok(inode, attr->ia_size);
+		if (ret)
+			return ret;
+		truncate_setsize(inode, attr->ia_size);
+	}
+
+	setattr_copy(idmap, inode, attr);
+	{
+		struct timespec64 now = current_time(inode);
+		struct timespec64 prev = inode_get_ctime(inode);
+
+		if (timespec64_compare(&now, &prev) <= 0) {
+			timespec64_add_ns(&prev, 1);
+			now = prev;
+		}
+		inode_set_ctime_to_ts(inode, now);
+	}
+	mark_inode_dirty(inode);
+	write_inode_now(inode, 1);
 	return 0;
 }
 
@@ -716,9 +855,14 @@ static int dfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 	}
 
 	inode_set_ctime_current(inode);
+	mark_inode_dirty(inode);
+	write_inode_now(inode, 1);
 	inode_set_mtime_to_ts(old_dir, inode_set_ctime_current(old_dir));
+	mark_inode_dirty(old_dir);
 	if (old_dir != new_dir)
 		inode_set_mtime_to_ts(new_dir, inode_set_ctime_current(new_dir));
+	if (old_dir != new_dir)
+		mark_inode_dirty(new_dir);
 	dfs_schedule_commit(old_dir->i_sb);
 	return 0;
 }
@@ -762,7 +906,7 @@ static const struct inode_operations dfs_dir_inode_operations = {
 
 static const struct file_operations dfs_dir_operations = {
 	.iterate_shared	= dfs_readdir,
-	.fsync		= generic_file_fsync,
+	.fsync		= dfs_fsync,
 	.llseek		= generic_file_llseek,
 };
 

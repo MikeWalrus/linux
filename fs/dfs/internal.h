@@ -94,10 +94,12 @@ int dfs_readdir(struct file *file, struct dir_context *ctx);
 bool dfs_root_dir_valid(struct inode *inode);
 unsigned int dfs_dir_rec_len(unsigned int name_len);
 umode_t dfs_dtype_to_mode(u8 dtype);
+umode_t dfs_dirent_mode(u8 file_type);
 void dfs_schedule_commit(struct super_block *sb);
 int dfs_alloc_inode_info(struct inode *inode);
 void dfs_free_inode(struct inode *inode);
 int dfs_write_inode(struct inode *inode, struct writeback_control *wbc);
+int dfs_fsync(struct file *file, loff_t start, loff_t end, int datasync);
 int dfs_read_inode_disk(struct super_block *sb, u32 ino,
 			 struct dfs_disk_inode *out);
 int dfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,

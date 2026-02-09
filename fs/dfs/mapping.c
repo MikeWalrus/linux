@@ -46,6 +46,9 @@ int dfs_inode_disk_location(struct super_block *sb, u32 ino,
 	*offset = off;
 	*index = off >> PAGE_SHIFT;
 	*page_off = page_offset;
+	dfs_info("inode_disk_location ino=%u offset=%lld index=%lu page_off=%u bdev_bytes=%llu\n",
+		 ino, off, (unsigned long)(off >> PAGE_SHIFT), page_offset,
+		 (unsigned long long)bdev_bytes);
 	return 0;
 }
 
@@ -116,6 +119,11 @@ int dfs_map_file_range(struct inode *inode, loff_t offset, loff_t length,
 	if (map_len == 0)
 		return -ENOSPC;
 
+	dfs_info("map_file_range ino=%lu off=%lld len=%lld start=%lld map_len=%lld base=%llu addr=%llu bdev_bytes=%llu\n",
+		 inode->i_ino, offset, length, start, map_len,
+		 (unsigned long long)di->base, (unsigned long long)addr,
+		 (unsigned long long)bdev_bytes);
+
 	*start_out = start;
 	*len_out = map_len;
 	*addr_out = addr;
@@ -129,6 +137,9 @@ int dfs_alloc_inode_info(struct inode *inode)
 	u64 chunk_bytes;
 	u64 base;
 	int ret;
+
+	if (sb)
+		inode->i_blkbits = sb->s_blocksize_bits;
 
 	ret = dfs_inode_base(sb, inode->i_ino, &base, &chunk_bytes);
 	if (ret)
