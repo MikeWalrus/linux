@@ -188,16 +188,17 @@ static int dfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 	loff_t start;
 	loff_t map_len;
 	u64 addr;
+	bool write_like = flags & (IOMAP_WRITE | IOMAP_ZERO | IOMAP_UNSHARE);
 	int ret;
 
-	if ((flags & IOMAP_WRITE) && length < sb->s_blocksize)
+	if (write_like && length < sb->s_blocksize)
 		length = sb->s_blocksize;
 
 	ret = dfs_map_file_range(inode, offset, length, &start, &map_len, &addr);
 	if (ret) {
 		pr_err("dfs: map_file_range failed ino=%lu off=%lld len=%lld flags=0x%x ret=%d\n",
 		       inode->i_ino, offset, length, flags, ret);
-		if (flags & IOMAP_WRITE)
+		if (write_like)
 			BUG();
 		return ret;
 	}
@@ -206,12 +207,14 @@ static int dfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 		 inode->i_ino, flags, offset, length, start, map_len,
 		 (unsigned long long)addr);
 
+	/* iomap core may reuse this object across iterations; reset all fields. */
+	memset(iomap, 0, sizeof(*iomap));
 	iomap->bdev = sb->s_bdev;
 	iomap->offset = start;
 	iomap->addr = addr;
 	iomap->length = map_len;
 
-	if (!(flags & IOMAP_WRITE)) {
+	if (!write_like) {
 		if (offset >= isize) {
 			dfs_info("iomap_begin hole ino=%lu off=%lld len=%lld isize=%lld\n",
 				 inode->i_ino, offset, length, isize);
@@ -229,7 +232,6 @@ static int dfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 			return 0;
 		}
 		iomap->type = IOMAP_MAPPED;
-		iomap->length = min_t(loff_t, iomap->length, isize - start);
 		return 0;
 	}
 
@@ -287,6 +289,21 @@ static ssize_t dfs_writeback_range(struct iomap_writepage_ctx *wpc,
 			 (unsigned long long)submit_offset,
 			 len,
 			 submit_len);
+
+		/*
+		 * We submit a full block even if only part of it is dirty.
+		 * Ensure bytes beyond EOF in this block are zero so we never
+		 * write uninitialized folio contents to disk.
+		 */
+		if (end_pos < submit_offset + submit_len) {
+			size_t zoff = end_pos - folio_pos(folio);
+			size_t zlen = submit_offset + submit_len - end_pos;
+
+			if (zoff < folio_size(folio) && zlen)
+				folio_zero_range(folio, zoff,
+						 min_t(size_t, zlen,
+						       folio_size(folio) - zoff));
+		}
 	}
 
 	if (submit_offset < wpc->iomap.offset ||
@@ -658,10 +675,63 @@ static int dfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	return 0;
 }
 
+
+static int dfs_discard_truncated_blocks(struct inode *inode,
+				    loff_t newsize,
+				    loff_t oldsize)
+{
+	struct dfs_inode_info *di = dfs_inode_info(inode);
+	struct block_device *bdev = inode->i_sb ? inode->i_sb->s_bdev : NULL;
+	unsigned int blocksize = i_blocksize(inode);
+	loff_t discard_from;
+	loff_t discard_to;
+	u64 phys;
+	sector_t sector;
+	sector_t nr_sects;
+	int ret;
+
+	if (!S_ISREG(inode->i_mode) || !di || !bdev || oldsize <= newsize)
+		return 0;
+	if (!bdev_max_discard_sectors(bdev))
+		return 0;
+
+	discard_from = ALIGN(newsize, blocksize);
+	discard_to = ALIGN_DOWN(oldsize, blocksize);
+	if (discard_to <= discard_from || discard_from < 0)
+		return 0;
+
+	if ((u64)discard_from >= di->chunk_bytes)
+		return 0;
+	if ((u64)discard_to > di->chunk_bytes)
+		discard_to = di->chunk_bytes;
+	if (discard_to <= discard_from)
+		return 0;
+
+	phys = di->base + (u64)discard_from;
+	sector = (sector_t)(phys >> SECTOR_SHIFT);
+	nr_sects = (sector_t)((discard_to - discard_from) >> SECTOR_SHIFT);
+	if (!nr_sects)
+		return 0;
+
+	ret = blkdev_issue_discard(bdev, sector, nr_sects, GFP_NOFS);
+	if (ret) {
+		dfs_info("truncate discard failed ino=%lu off=%lld len=%lld err=%d\n",
+			 inode->i_ino, discard_from,
+			 discard_to - discard_from, ret);
+		/* Discard is best-effort: truncate semantics must still succeed. */
+		return 0;
+	}
+
+	dfs_info("truncate discard ino=%lu off=%lld len=%lld\n",
+		 inode->i_ino, discard_from, discard_to - discard_from);
+	return 0;
+}
+
 int dfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		 struct iattr *attr)
 {
 	struct inode *inode = d_inode(dentry);
+	struct address_space *mapping = inode->i_mapping;
 	int ret;
 
 	ret = setattr_prepare(idmap, dentry, attr);
@@ -669,10 +739,47 @@ int dfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		return ret;
 
 	if (attr->ia_valid & ATTR_SIZE) {
-		ret = inode_newsize_ok(inode, attr->ia_size);
+		loff_t oldsize = i_size_read(inode);
+		loff_t newsize = attr->ia_size;
+
+		ret = inode_newsize_ok(inode, newsize);
 		if (ret)
 			return ret;
-		truncate_setsize(inode, attr->ia_size);
+
+		filemap_invalidate_lock(mapping);
+
+		if (newsize < oldsize) {
+			/*
+			 * Integrate truncate with iomap: zero the partial EOF block first,
+			 * then update i_size and drop whole blocks via discard.
+			 */
+			ret = iomap_truncate_page(inode, newsize, NULL,
+						  &dfs_iomap_ops, NULL, NULL);
+			if (ret)
+				goto out_invalidate;
+		} else if (newsize > oldsize) {
+			/*
+			 * Zero newly exposed range so truncate-up does not reveal stale
+			 * contents from the fixed on-disk chunk.
+			 */
+			i_size_write(inode, newsize);
+			ret = iomap_zero_range(inode, oldsize, newsize - oldsize,
+					       NULL, &dfs_iomap_ops,
+					       NULL, NULL);
+			if (ret) {
+				truncate_setsize(inode, oldsize);
+				goto out_invalidate;
+			}
+		}
+
+		truncate_setsize(inode, newsize);
+
+		if (newsize < oldsize)
+			ret = dfs_discard_truncated_blocks(inode, newsize, oldsize);
+out_invalidate:
+		filemap_invalidate_unlock(mapping);
+		if (ret)
+			return ret;
 	}
 
 	setattr_copy(idmap, inode, attr);
@@ -690,7 +797,6 @@ int dfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	write_inode_now(inode, 1);
 	return 0;
 }
-
 static struct dentry *dfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 				 struct dentry *dentry, umode_t mode)
 {
@@ -907,4 +1013,3 @@ static const struct file_operations dfs_dir_operations = {
 	.fsync		= dfs_fsync,
 	.llseek		= generic_file_llseek,
 };
-
