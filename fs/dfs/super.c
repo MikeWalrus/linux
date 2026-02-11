@@ -194,7 +194,9 @@ static int dfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	INIT_DELAYED_WORK(&sbi->commit_work, dfs_commit_work);
 	atomic_set(&sbi->next_ino, 1);
 	blocks = div_u64(bdev_nr_bytes(sb->s_bdev), sb->s_blocksize);
-	sbi->chunk_blocks = min_t(u64, 1024, max_t(u64, 1, blocks));
+	sbi->chunk_blocks = div_u64(DFS_CHUNK_BYTES, sb->s_blocksize);
+	if (sbi->chunk_blocks == 0)
+		sbi->chunk_blocks = 1;
 	sb->s_fs_info = sbi;
 	sb->s_op = &dfs_ops;
 	sb->s_d_flags = 0;
