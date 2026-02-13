@@ -229,7 +229,8 @@ static int dfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 			return 0;
 		}
 		iomap->type = IOMAP_MAPPED;
-		iomap->length = min_t(loff_t, iomap->length, isize - start);
+		if (flags & (IOMAP_DIRECT | IOMAP_REPORT))
+			iomap->length = min_t(loff_t, iomap->length, isize - start);
 		return 0;
 	}
 
@@ -669,10 +670,49 @@ int dfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		return ret;
 
 	if (attr->ia_valid & ATTR_SIZE) {
+		loff_t oldsize = inode->i_size;
+		bool did_zero = false;
+		int zero_ret;
+
 		ret = inode_newsize_ok(inode, attr->ia_size);
 		if (ret)
 			return ret;
-		truncate_setsize(inode, attr->ia_size);
+		inode_dio_wait(inode);
+		filemap_invalidate_lock(inode->i_mapping);
+		if (attr->ia_size < oldsize) {
+			zero_ret = iomap_truncate_page(
+				inode,
+				attr->ia_size,
+				&did_zero,
+				&dfs_iomap_ops,
+				NULL,
+				NULL);
+			if (zero_ret) {
+				filemap_invalidate_unlock(inode->i_mapping);
+				return zero_ret;
+			}
+		}
+		if (attr->ia_size > oldsize) {
+			truncate_setsize(inode, attr->ia_size);
+			zero_ret = iomap_zero_range(
+				inode,
+				oldsize,
+				attr->ia_size - oldsize,
+				&did_zero,
+				&dfs_iomap_ops,
+				NULL,
+				NULL);
+			if (zero_ret) {
+				truncate_setsize(inode, oldsize);
+				truncate_pagecache(inode, oldsize);
+				filemap_invalidate_unlock(inode->i_mapping);
+				return zero_ret;
+			}
+		}
+		if (attr->ia_size < oldsize)
+			truncate_setsize(inode, attr->ia_size);
+		truncate_pagecache(inode, attr->ia_size);
+		filemap_invalidate_unlock(inode->i_mapping);
 	}
 
 	setattr_copy(idmap, inode, attr);
