@@ -34,6 +34,23 @@ int dfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 	err = __generic_file_fsync(file, start, end, datasync);
 	if (err)
 		return err;
+	if (file->f_path.dentry && file->f_path.dentry->d_parent) {
+		struct inode *dir_inode = d_inode(file->f_path.dentry->d_parent);
+
+		if (dir_inode) {
+			loff_t dir_end = dir_inode->i_size ? dir_inode->i_size - 1 : 0;
+
+			err = filemap_fdatawrite_range(dir_inode->i_mapping, 0,
+						     dir_end);
+			if (!err)
+				err = filemap_fdatawait_range(dir_inode->i_mapping, 0,
+						    dir_end);
+			if (!err)
+				err = sync_inode_metadata(dir_inode, 1);
+			if (err)
+				return err;
+		}
+	}
 	if (!bdev)
 		return 0;
 	dfs_info("fsync: bdev=%pg write_cache=%d synchronous=%d fua=%d\n",
@@ -804,6 +821,7 @@ static int dfs_link(struct dentry *old_dentry, struct inode *dir,
 	ihold(inode);
 	inc_nlink(inode);
 	inode_set_ctime_current(inode);
+	mark_inode_dirty(inode);
 	d_instantiate(dentry, inode);
 	inode_update_time(dir, S_MTIME | S_CTIME);
 	dfs_schedule_commit(dir->i_sb);
@@ -824,6 +842,7 @@ static int dfs_unlink(struct inode *dir, struct dentry *dentry)
 
 	drop_nlink(inode);
 	inode_set_ctime_current(inode);
+	mark_inode_dirty(inode);
 	inode_update_time(dir, S_MTIME | S_CTIME);
 	dfs_schedule_commit(dir->i_sb);
 	return 0;
