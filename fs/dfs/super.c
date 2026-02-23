@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/fs.h>
+#include <linux/writeback.h>
 #include <linux/pagemap.h>
 #include <linux/init.h>
 #include <linux/blkdev.h>
@@ -73,7 +74,7 @@ static int dfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 
 static const struct super_operations dfs_ops = {
 	.statfs		= dfs_statfs,
-	.drop_inode	= inode_just_drop,
+	.evict_inode	= dfs_evict_inode,
 	.free_inode	= dfs_free_inode,
 	.write_inode	= dfs_write_inode,
 	.dirty_inode	= dfs_dirty_inode,
@@ -178,6 +179,8 @@ static int dfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		return -EINVAL;
 	if (sb->s_bdev)
 		invalidate_bdev(sb->s_bdev);
+	if (!sb->s_bdev || bdev_max_discard_sectors(sb->s_bdev) == 0)
+		return -EOPNOTSUPP;
 
 	if (dfs_read_validate_super(sb, &on_disk))
 		return -EINVAL;

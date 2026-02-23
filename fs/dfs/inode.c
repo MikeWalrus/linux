@@ -15,6 +15,75 @@
 
 #include "internal.h"
 
+#define DFS_DISCARD_MAX_BYTES (128UL * 1024 * 1024)
+
+static int dfs_issue_discard(struct super_block *sb, u64 base, u64 len)
+{
+	struct block_device *bdev = sb ? sb->s_bdev : NULL;
+	u64 gran;
+	u64 start;
+	u64 end;
+	sector_t sector;
+	u64 bytes;
+	int ret = 0;
+
+	if (!bdev || len == 0)
+		return 0;
+	if (bdev_max_discard_sectors(bdev) == 0)
+		return 0;
+	gran = bdev_discard_granularity(bdev);
+	if (gran == 0)
+		gran = sb->s_blocksize;
+	start = ALIGN(base, gran);
+	end = ALIGN_DOWN(base + len, gran);
+	if (end <= start)
+		return 0;
+
+	bytes = end - start;
+	sector = start >> 9;
+	while (bytes) {
+		u64 chunk = min_t(u64, bytes, DFS_DISCARD_MAX_BYTES);
+		u64 sectors = chunk >> 9;
+
+		if (sectors == 0)
+			break;
+		ret = blkdev_issue_discard(bdev, sector, sectors, GFP_NOFS);
+		if (ret)
+			return ret;
+		sector += sectors;
+		bytes -= (sectors << 9);
+	}
+	return 0;
+}
+
+static void dfs_discard_inode_range(struct inode *inode, u64 offset, u64 len)
+{
+	struct dfs_inode_info *di = inode->i_private;
+	u64 base;
+
+	if (!di || len == 0)
+		return;
+	if (offset >= di->chunk_bytes)
+		return;
+	len = min_t(u64, len, di->chunk_bytes - offset);
+	base = di->base + offset;
+	dfs_issue_discard(inode->i_sb, base, len);
+}
+
+static void dfs_discard_inode(struct inode *inode)
+{
+	struct dfs_inode_info *di = inode->i_private;
+
+	if (!di)
+		return;
+	if (di->chunk_bytes == 0)
+		return;
+	if (inode->i_size == 0)
+		return;
+	if (S_ISREG(inode->i_mode) || S_ISDIR(inode->i_mode) || S_ISLNK(inode->i_mode))
+		dfs_discard_inode_range(inode, 0, di->chunk_bytes);
+}
+
 static const struct inode_operations dfs_dir_inode_operations;
 static const struct file_operations dfs_dir_operations;
 
@@ -34,6 +103,13 @@ int dfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 	err = __generic_file_fsync(file, start, end, datasync);
 	if (err)
 		return err;
+	if (S_ISDIR(inode->i_mode)) {
+		down_read(&inode->i_sb->s_umount);
+		err = sync_filesystem(inode->i_sb);
+		up_read(&inode->i_sb->s_umount);
+		if (err)
+			return err;
+	}
 	if (file->f_path.dentry && file->f_path.dentry->d_parent) {
 		struct inode *dir_inode = d_inode(file->f_path.dentry->d_parent);
 
@@ -365,6 +441,14 @@ void dfs_free_inode(struct inode *inode)
 {
 	kfree(inode->i_private);
 	inode->i_private = NULL;
+}
+
+void dfs_evict_inode(struct inode *inode)
+{
+	truncate_inode_pages_final(&inode->i_data);
+	clear_inode(inode);
+	if (inode->i_nlink == 0)
+		dfs_discard_inode(inode);
 }
 
 static unsigned long dfs_get_unmapped_area(struct file *file,
@@ -708,6 +792,8 @@ int dfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 				filemap_invalidate_unlock(inode->i_mapping);
 				return zero_ret;
 			}
+			dfs_discard_inode_range(inode, attr->ia_size,
+						 oldsize - attr->ia_size);
 		}
 		if (attr->ia_size > oldsize) {
 			truncate_setsize(inode, attr->ia_size);
@@ -866,6 +952,7 @@ static int dfs_rmdir(struct inode *dir, struct dentry *dentry)
 	drop_nlink(inode);
 	drop_nlink(dir);
 	inode_set_ctime_current(inode);
+	dfs_discard_inode(inode);
 	inode_update_time(dir, S_MTIME | S_CTIME);
 	dfs_schedule_commit(dir->i_sb);
 	return 0;

@@ -100,6 +100,7 @@ unsigned int dfs_dir_rec_len(unsigned int name_len);
 void dfs_schedule_commit(struct super_block *sb);
 int dfs_alloc_inode_info(struct inode *inode);
 void dfs_free_inode(struct inode *inode);
+void dfs_evict_inode(struct inode *inode);
 int dfs_write_inode(struct inode *inode, struct writeback_control *wbc);
 int dfs_fsync(struct file *file, loff_t start, loff_t end, int datasync);
 int dfs_read_inode_disk(struct super_block *sb, u32 ino,
